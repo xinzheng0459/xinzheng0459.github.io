@@ -1,0 +1,580 @@
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="ie=edge">
+<title>gRPC Deep Dive (4): Framer - zhengxin&#39;s blog</title>
+<link rel="shortcut icon" href="https://xinzheng0459.github.io/favicon.ico">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.2.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/animate.css@3.7.2/animate.min.css">
+<link rel="stylesheet" href="https://xinzheng0459.github.io/media/css/tailwind.css">
+<link rel="stylesheet" href="https://xinzheng0459.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="gRPC Deep Dive (4): Framer - zhengxin&#39;s blog - Atom Feed" href="https://xinzheng0459.github.io/atom.xml">
+
+    
+
+  <meta name="description" content="
+In the previous articles, we got an overview of how the gRPC server works. Starting with this article, let&#39;s take a loo..." />
+  <meta property="og:title" content="gRPC Deep Dive (4): Framer - zhengxin&#39;s blog">
+  <meta property="og:description" content="
+In the previous articles, we got an overview of how the gRPC server works. Starting with this article, let&#39;s take a loo..." />
+  <meta property="og:type" content="articles">
+  <meta property="og:url" content="https://xinzheng0459.github.io/post/grpc-deep-dive-4-framer/" />
+  <meta property="og:image" content="https://xinzheng0459.github.io/images/avatar.png">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:width" content="1200">
+  <meta name="twitter:title" content="gRPC Deep Dive (4): Framer - zhengxin&#39;s blog">
+  <meta name="twitter:description" content="
+In the previous articles, we got an overview of how the gRPC server works. Starting with this article, let&#39;s take a loo...">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" href="https://xinzheng0459.github.io/post/grpc-deep-dive-4-framer/">
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.css">
+ 
+  
+    <link rel="stylesheet" href="https://xinzheng0459.github.io/media/css/prism-atom-dark.css">
+  
+
+  
+</head>
+
+<body>
+  <div class="antialiased flex flex-col min-h-screen" id="app">
+    <a href="https://xinzheng0459.github.io" class="fixed top-0 left-0 mt-4 bg-black text-white dark:text-gray-700 dark:bg-yellow-50 dark:hover:bg-black dark:hover:text-white inline-flex p-2 pl-8 hover:text-gray-700 hover:bg-yellow-50 font-bold z-10 transition-fast animated fadeInLeft">
+      zhengxin&#39;s blog
+    </a>
+    <div class="max-w-4xl w-full mx-auto">
+      <div class="shadow-box bg-white dark:bg-gray-600 rounded-lg pt-32 md:pt-64 px-4 md:px-8 pb-8 animated fadeIn mb-8">
+        <h1 class="text-5xl font-semibold leading-normal pb-8 mb-8 border-b-8 border-gray-700">
+          gRPC Deep Dive (4): Framer
+        </h1>
+        
+        <div class="mb-8 flex flex-wrap">
+          <div class="text-gray-400 text-sm mr-4">2022-07-11 · 12 min read</div>
+          
+        </div>
+        <div class="markdown mb-8" v-pre>
+          <figure data-type="image" tabindex="1"><img src="https://cncf-branding.netlify.app/img/projects/grpc/horizontal/color/grpc-horizontal-color.png" alt="gRPC icon" loading="lazy"></figure>
+<p>In the previous articles, we got an overview of how the gRPC server works. Starting with this article, let's take a look at some of the design details of the gRPC server.<br>
+Regardless of how the gRPC server is designed, it will eventually send the results of the RPC execution to the client in the form of HTTP/2 frames. This article will dig into its implementation.</p>
+<h1 id="framer-in-server">Framer in Server</h1>
+<p>Each time the gRPC server receives a new connection from a client, it creates a Framer, <code>which</code> is actually the interface responsible for sending and receiving HTTP2 frames. The <code>Framer</code> is responsible for sending and receiving the frames for that particular client, regardless of the underlying streams.</p>
+<figure data-type="image" tabindex="2"><a href="https://mermaid.live/edit#pako:eNp1kMEOgjAMhl9l6QkSOICedjBR0RfA4y6VFSEyIGWYGMK7OwVM1LhT939f07QDZI0mkHBhbAtxSlQt3MvQ21cl1VZsfRGGG9F5KfGN2J_5eeG7mU959_rkkXdkNG97TuPPNI-mTsuRl1omND8g_gLxAlb_wHoBEIAbZbDUbrnhqSmwBRlSIF2pka8KVD06r281Wjro0jYMMseqowCwt016rzOQlntapKREdygzW-MDkzNfZw"><img src="https://mermaid.ink/img/pako:eNp1kMEOgjAMhl9l6QkSOICedjBR0RfA4y6VFSEyIGWYGMK7OwVM1LhT939f07QDZI0mkHBhbAtxSlQt3MvQ21cl1VZsfRGGG9F5KfGN2J_5eeG7mU959_rkkXdkNG97TuPPNI-mTsuRl1omND8g_gLxAlb_wHoBEIAbZbDUbrnhqSmwBRlSIF2pka8KVD06r281Wjro0jYMMseqowCwt016rzOQlntapKREdygzW-MDkzNfZw" alt="" loading="lazy"></a></figure>
+<pre><code class="language-go">type framer struct {
+    // a writer that writes to a net.Conn
+	writer *bufWriter
+    // native http2.Framer, responsible for data reading and writing
+	fr     *http2.Framer
+}
+</code></pre>
+<p><code>Framer</code> is actually a wrapper around golang's native <code>http2.Framer</code>.</p>
+<pre><code class="language-go">type bufWriter struct {
+	buf       []byte
+	offset    int
+	batchSize int
+	conn      net.Conn
+	err       error
+
+	onFlush func()
+}
+
+func newBufWriter(conn net.Conn, batchSize int) *bufWriter {
+	return &amp;bufWriter{
+		buf:       make([]byte, batchSize*2),
+		batchSize: batchSize,
+		conn:      conn,
+	}
+}
+
+func (w *bufWriter) Write(b []byte) (n int, err error) {
+    // check if the last write failed
+	if w.err != nil {
+		return 0, w.err
+	}
+    // if batchSize is 0, we don't need to write to the buffer, just write to the net.Conn
+	if w.batchSize == 0 { // Buffer has been disabled.
+		return w.conn.Write(b)
+	}
+    // If the length of the data to be written is greater than the remaining space in the buffer,
+    // we need to flush the buffer before writing to it.
+	for len(b) &gt; 0 {
+		nn := copy(w.buf[w.offset:], b)
+		b = b[nn:]
+		w.offset += nn
+		n += nn
+        // If the length of the data to be written is greater than the remaining space in the buffer,
+		if w.offset &gt;= w.batchSize {
+			err = w.Flush()
+		}
+	}
+	return n, err
+}
+
+// flush the buffer to the net.Conn
+func (w *bufWriter) Flush() error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.offset == 0 {
+		return nil
+	}
+	if w.onFlush != nil {
+		w.onFlush()
+	}
+	_, w.err = w.conn.Write(w.buf[:w.offset])
+	w.offset = 0
+	return w.err
+}
+</code></pre>
+<p>gRPC server implements a simple write cache in <code>http_util.go</code>, which is used by <code>http2.framer</code> as <code>io.Writer</code>.</p>
+<pre><code class="language-go">func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderListSize uint32) *framer {
+	if writeBufferSize &lt; 0 {
+		writeBufferSize = 0
+	}
+	var r io.Reader = conn
+	if readBufferSize &gt; 0 {
+		r = bufio.NewReaderSize(r, readBufferSize)
+	}
+	w := newBufWriter(conn, writeBufferSize)
+	f := &amp;framer{
+		writer: w,
+		fr:     http2.NewFramer(w, r),
+	}
+	......
+
+	return f
+}
+</code></pre>
+<p>The <code>io.Reader</code> passed to <code>http2.framer</code> uses a <code>bufio.Reader</code> as the underlying implementation.</p>
+<h1 id="send-data-from-server">Send Data from Server</h1>
+<p>The gRPC server creates a <code>loopyWriter</code> for each client, and the <code>loopyWriter</code> is responsible for sending the data to the client.</p>
+<pre><code class="language-go">type loopyWriter struct {
+	......
+	cbuf      *controlBuffer
+	......
+    // estdStreams stores all the streams that haven't received headers frame yet.
+	estdStreams map[uint32]*outStream // Established streams.
+    // activeStreams is a list of streams, where each stream is a list of data items.
+	activeStreams *outStreamList
+    // framer that writes to the underlying connection
+	framer        *framer
+	......
+}
+</code></pre>
+<figure data-type="image" tabindex="3"><img src="https://xinzheng0459.github.io/post-images/gRPC_Deep_Dive/activeStreams.png" alt="activeStreams" loading="lazy"></figure>
+<p>The <code>loopyWriter</code> coordinates internal <code>controlBuffer</code> and <code>activeStreams</code> at runtime to send data in an orderly fashion, roughly as follows:</p>
+<ol>
+<li><code>loopyWriter</code> reads the next message to be sent to the client from the <code>controlBuffer</code> corresponding to the client. <code>controlBuffer</code> may hold a variety of messages, including but not limited to dataFrame. <code>controlBuffer</code> also acts as the <code>controlBuffer</code> is also responsible for client level traffic control.</li>
+<li>A dataFrame, for example, may contain multiple HTTP2 data frames. The dataFrame is first placed at the end of the <code>itemList</code> of the corresponding stream. Each stream maintains an <code>itemList</code>, which holds the data to be sent.</li>
+<li>The <code>loopyWriter</code> maintains a chain of streams, i.e. <code>activeStreams</code> . Each time <code>loopyWriter</code> takes the stream at the head of the chain, sends up to 16KB of data from its <code>itemList</code> to the client, and then puts the stream at the end of the <code>activeStreams</code> chain.</li>
+</ol>
+<p>In the communication between gRPC server and client, all streams (i.e. all RPC calls) share one <code>loopyWriter</code>.</p>
+<pre><code class="language-go">// run should be run in a separate goroutine.
+// It reads control frames from controlBuf and processes them by:
+// 1. Updating loopy's internal state, or/and
+// 2. Writing out HTTP2 frames on the wire.
+//
+// Loopy keeps all active streams with data to send in a linked-list.
+// All streams in the activeStreams linked-list must have both:
+// 1. Data to send, and
+// 2. Stream level flow control quota available.
+//
+// In each iteration of run loop, other than processing the incoming control
+// frame, loopy calls processData, which processes one node from the activeStreams linked-list.
+// This results in writing of HTTP2 frames into an underlying write buffer.
+// When there's no more control frames to read from controlBuf, loopy flushes the write buffer.
+// As an optimization, to increase the batch size for each flush, loopy yields the processor, once
+// if the batch size is too low to give stream goroutines a chance to fill it up.
+func (l *loopyWriter) run() (err error) {
+	defer func() {
+		if err == ErrConnClosing {
+			// Don't log ErrConnClosing as error since it happens
+			// 1. When the connection is closed by some other known issue.
+			// 2. User closed the connection.
+			// 3. A graceful close of connection.
+			if logger.V(logLevel) {
+				logger.Infof(&quot;transport: loopyWriter.run returning. %v&quot;, err)
+			}
+			err = nil
+		}
+	}()
+	for {
+        // block current goroutine
+		it, err := l.cbuf.get(true)
+		if err != nil {
+			return err
+		}
+        // handle data from controlBuffer, dataFrame will be appended to the end of the corresponding stream's itemList
+		if err = l.handle(it); err != nil {
+			return err
+		}
+        // send the first stream in the activeStreams linked-list, with at most 16KB of data
+		if _, err = l.processData(); err != nil {
+			return err
+		}
+		gosched := true
+	hasdata:
+		for {
+			// 不 block 当前 goroutine
+			it, err := l.cbuf.get(false)
+			if err != nil {
+				return err
+			}
+			if it != nil {
+				if err = l.handle(it); err != nil {
+					return err
+				}
+				if _, err = l.processData(); err != nil {
+					return err
+				}
+				continue hasdata
+			}
+			isEmpty, err := l.processData()
+			if err != nil {
+				return err
+			}
+			if !isEmpty {
+				continue hasdata
+			}
+			if gosched {
+				gosched = false
+                // when there is no enough data in the writer buffer, yield processor to let other goroutines fill int the buffer
+				if l.framer.writer.offset &lt; minBatchSize {
+					runtime.Gosched()
+					continue hasdata
+				}
+			}
+			l.framer.writer.Flush()
+			break hasdata
+
+		}
+	}
+}
+</code></pre>
+<p>There are a few things to note about the <code>run</code> method:</p>
+<ol>
+<li><code>l.cbuf.get</code> is called twice, the first time blocking the current goroutine, but not the second. The first call is blocking because there is no more data to send in all <code>activeStreams</code>, so it blocks to avoid pointless polling. The second non-blocking call is made because the <code>activeStreams</code> may still have data to send and should continue to send data to the client regardless of whether there is new data in the <code>controlBuffer</code>.</li>
+<li>When the data in the write cache in the framer is less than <code>minBatchSize</code>, loopyWriter actively abandons the CPU. When loopyWriter sends data faster than the gRPC server can generate data, loopyWriter abandons the CPU and lets other goroutines (stream s goroutine) to fill the data. This is done in order to pass as much data as possible to <code>net.Conn</code>.</li>
+</ol>
+<h1 id="loopywriter">loopyWriter</h1>
+<pre><code class="language-go">func (l *loopyWriter) processData() (bool, error) {
+    // connection level flow control
+	if l.sendQuota == 0 {
+		return true, nil
+	}
+    // peek the first stream in the activeStreams linked-list
+	str := l.activeStreams.dequeue()
+	if str == nil {
+		return true, nil
+	}
+    // item must be a dataFrame, which is defined in gRPC. It may contain multiple HTTP2 data frames.
+	dataItem := str.itl.peek().(*dataFrame)
+
+	if len(dataItem.h) == 0 &amp;&amp; len(dataItem.d) == 0 { // Empty data frame
+		......
+	}
+    // ensure the data to be sent is within the flow control window.
+	var (
+		buf []byte
+	)
+	......
+    // send the data to the client via framer
+	if err := l.framer.fr.WriteData(dataItem.streamID, endStream, buf[:size]); err != nil {
+		return false, err
+	}
+	......
+	if str.itl.isEmpty() {
+		......
+	} else {
+        // if the stream has more data to send, enqueue it back to the activeStreams linked-list
+		l.activeStreams.enqueue(str)
+	}
+	return false, nil
+}
+</code></pre>
+<p>In <code>loopyWriter.run()</code>, the <code>processData</code> function is executed continuously, in which the first stream in activeStreams is fetched:</p>
+<ol>
+<li>Fetches the first stream from <code>activeStreams</code>.</li>
+<li>The first element of the <code>itemList</code> of the stream is fetched, which must be a dataFrame. dataFrame is a data structure defined in gRPC that contains the data to be sent to the client. The size of a dataFrame may exceed the <code>http2MaxFrameLen</code> limit and will eventually be split into multiple HTTP2 data frames and sent out.</li>
+<li>After traffic control, the size of the data that can be sent is determined and the data to be sent is stored in a <code>buf</code>.</li>
+<li>The data is sent to the client via framer.</li>
+<li>If there is still data to be sent in the stream, the stream is put back into the <code>activeStreams</code>.</li>
+</ol>
+<p>The data in the stream is stored in a single-linked <code>itemList</code> table, so let's see how gRPC implements this single-linked table.</p>
+<pre><code class="language-go">// node in the linked-list
+type itemNode struct {
+	it   interface{}
+	next *itemNode
+}
+
+// itemList contains the header and tail pointer
+type itemList struct {
+	head *itemNode
+	tail *itemNode
+}
+
+func (il *itemList) enqueue(i interface{}) {
+    // construct node
+	n := &amp;itemNode{it: i}
+    // if the tail pointer is nil, the list is empty
+	if il.tail == nil {
+        // head and tail pointer both point to the new node
+		il.head, il.tail = n, n
+		return
+	}
+    // there is at least one node in the list, so the tail pointer's next pointer points to the new node
+	il.tail.next = n
+    // update the tail pointer
+	il.tail = n
+}
+
+// return the first element of the linked-list, but do not remove it from the linked-list
+func (il *itemList) peek() interface{} {
+	return il.head.it
+}
+
+// remove the first element of the linked-list
+func (il *itemList) dequeue() interface{} {
+    // header is nil, return nil
+	if il.head == nil {
+		return nil
+	}
+    // i points to header
+	i := il.head.it
+    // header points to next node
+	il.head = il.head.next
+    // if the list is empty, update tail pointer to nil
+	if il.head == nil {
+		il.tail = nil
+	}
+	return i
+}
+
+// clear the linked-list
+func (il *itemList) dequeueAll() *itemNode {
+    // set head and tail pointer to nil
+	h := il.head
+	il.head, il.tail = nil, nil
+	return h
+}
+
+// check if the linked-list is empty
+func (il *itemList) isEmpty() bool {
+	return il.head == nil
+}
+</code></pre>
+<h1 id="summary">Summary</h1>
+<p>In this article we learn how the gRPC server sends HTTP2 frames to the client. We can see that the gRPC server sends all streams in a round robin fashion to ensure that the data in each stream is transferred equally to the client.</p>
+
+        </div>
+        <!-- Share to Twitter, Weibo, Telegram -->
+        <div class="flex items-center">
+          <div class="mr-4 flex items-center">
+            <i class="ri-share-forward-line text-gray-500"></i>
+          </div>
+          <div class="px-4 cursor-pointer text-blue-500 hover:bg-blue-100 dark:hover:bg-gray-600 inline-flex" @click="shareToTwitter">
+            <i class="ri-twitter-line"></i>
+          </div>
+          <div class="px-4 cursor-pointer text-red-500 hover:bg-red-100 dark:hover:bg-gray-600 inline-flex" @click="shareToWeibo">
+            <i class="ri-weibo-line"></i>
+          </div>
+          <div class="px-4 cursor-pointer text-indigo-500 hover:bg-indigo-100 dark:hover:bg-gray-600 inline-flex" @click="shareToTelegram">
+            <i class="ri-telegram-line"></i>
+          </div>
+        </div>
+      </div>
+
+      
+
+      
+
+      <footer class="py-12 text-center px-4 md:px-0" v-pre>
+  
+</footer>
+    </div>
+
+    <!-- TOC Container -->
+    <div class="fixed right-0 bottom-0 mb-16 mr-4 shadow w-8 h-8 rounded-full flex justify-center items-center z-10 cursor-pointer bg-white dark:bg-gray-500 dark:text-gray-200 hover:shadow-lg transition-all animated fadeInRight" @click="showToc = true">
+      <i class="ri-file-list-line"></i>
+    </div>
+
+    <div class="fixed right-0 top-0 bottom-0 overflow-y-auto w-64 bg-white dark:bg-gray-800 p-4 border-l border-gray-100 dark:border-gray-600 z-10 transition-fast" :class="{ '-mr-64': !showToc }">
+      <div class="flex mb-4 justify-end">
+        <div class="w-8 h-8 inline-flex justify-center items-center rounded-full cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-600 transition-fast" @click="showToc = false">
+          <i class="ri-close-line text-lg"></i>
+        </div>
+      </div>
+      <div class="post-toc-container">
+        <ul class="markdownIt-TOC">
+<li><a href="#framer-in-server">Framer in Server</a></li>
+<li><a href="#send-data-from-server">Send Data from Server</a></li>
+<li><a href="#loopywriter">loopyWriter</a></li>
+<li><a href="#summary">Summary</a></li>
+</ul>
+
+      </div>
+    </div>
+
+    <!-- Back to top -->
+    <div class="fixed right-0 bottom-0 mb-4 mr-4 shadow w-8 h-8 rounded-full flex justify-center items-center z-10 cursor-pointer bg-white hover:shadow-lg transition-all dark:bg-gray-500 dark:text-gray-200" @click="backToUp" v-show="scrolled">
+      <i class="ri-arrow-up-line"></i>
+    </div>
+  </div>
+
+  <!-- Root element of PhotoSwipe. Must have class pswp. -->
+<div class="pswp" tabindex="-1" role="dialog" aria-hidden="true">
+  <!-- Background of PhotoSwipe. 
+        It's a separate element as animating opacity is faster than rgba(). -->
+  <div class="pswp__bg">
+  </div>
+  <!-- Slides wrapper with overflow:hidden. -->
+  <div class="pswp__scroll-wrap">
+    <!-- Container that holds slides. 
+            PhotoSwipe keeps only 3 of them in the DOM to save memory.
+            Don't modify these 3 pswp__item elements, data is added later on. -->
+    <div class="pswp__container">
+      <div class="pswp__item">
+      </div>
+      <div class="pswp__item">
+      </div>
+      <div class="pswp__item">
+      </div>
+    </div>
+    <!-- Default (PhotoSwipeUI_Default) interface on top of sliding area. Can be changed. -->
+    <div class="pswp__ui pswp__ui--hidden">
+      <div class="pswp__top-bar">
+        <!--  Controls are self-explanatory. Order can be changed. -->
+        <div class="pswp__counter">
+        </div>
+        <button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+        <button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+        <button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button>
+        <!-- Preloader demo http://codepen.io/dimsemenov/pen/yyBWoR -->
+        <!-- element will get class pswp__preloader--active when preloader is running -->
+        <div class="pswp__preloader">
+          <div class="pswp__preloader__icn">
+            <div class="pswp__preloader__cut">
+              <div class="pswp__preloader__donut">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap">
+        <div class="pswp__share-tooltip">
+        </div>
+      </div>
+      <button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+      </button>
+      <button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)">
+      </button>
+      <div class="pswp__caption">
+        <div class="pswp__caption__center">
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/vue/dist/vue.js"></script>
+  <script src="https://xinzheng0459.github.io/media/scripts/main.js"></script>
+  
+  <!-- Code Highlight -->
+  
+    <script src="https://xinzheng0459.github.io/media/prism.js"></script>
+    <script>
+      Prism.highlightAll()
+    </script>
+  
+
+  <script src="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js"></script>
+  <script>
+    //拿到预览框架，也就是上面的html代码
+    var pswpElement = document.querySelectorAll('.pswp')[0];
+    //定义图片数组变量
+    var imgitems;
+    /**
+    * 用于显示预览界面
+    * @param index 图片数组下标
+    */
+    function viewImg(index) {
+      //其它选项这里不做过多阐述，详情见官网
+      var pswpoptions = {
+        index: parseInt(index, 10), // 开始幻灯片索引。0是第一张幻灯片。必须是整数，而不是字符串。
+        bgOpacity: 0.7, // 背景透明度，0-1
+        maxSpreadZoom: 3, // 缩放级别，不要太大
+      };
+      //初始化并打开PhotoSwipe，pswpElement对应上面预览框架，PhotoSwipeUI_Default为皮肤，imgitems为图片数组，pswpoptions为选项
+      var gallery = new PhotoSwipe(pswpElement, PhotoSwipeUI_Default, imgitems, pswpoptions);
+      gallery.init()
+    }
+    /**
+    * 用于添加图片点击事件
+    * @param img 图片元素
+    * @param index 所属下标（在imgitems中的位置）
+    */
+    function addImgClick(img, index) {
+      img.onclick = function() {
+        viewImg(index)
+      }
+    }
+    /**
+    * 轮询所有图片，获取src、width、height等数据，加入imgitems，并给图片元素添加事件
+    * 最好在onload中执行该方法，本站因放在最底部，所以直接初始化
+    * 异步加载图片可在图片元素创建完成后调用此方法
+    */
+    function initImg() {
+      //重置图片数组
+      imgitems = [];
+      //查找class:markdown 下的所有img元素并遍历
+      var imgs = document.querySelectorAll('.markdown img');
+      for (var i = 0; i < imgs.length; i++) {
+        var img = imgs[i];
+        //本站相册初始为loading图片，真实图片放在data-src
+        var ds = img.getAttribute("data-src");
+        //创建image对象，用于获取图片宽高
+        var imgtemp = new Image();
+        //判断是否存在data-src
+        if (ds != null && ds.length > 0) {
+          imgtemp.src = ds
+        } else {
+          imgtemp.src = img.src
+        }
+        //判断是否存在缓存
+        if (imgtemp.complete) {
+          var imgobj = {
+            "src": imgtemp.src,
+            "w": imgtemp.width,
+            "h": imgtemp.height,
+          };
+          imgitems[i] = imgobj;
+          addImgClick(img, i);
+        } else {
+          console.log('进来了2')
+          imgtemp.index = i;
+          imgtemp.img = img;
+          imgtemp.onload = function() {
+            var imgobj = {
+              "src": this.src,
+              "w": this.width,
+              "h": this.height,
+            };
+            //不要使用push，因为onload前后顺序会不同
+            imgitems[this.index] = imgobj
+            //添加点击事件
+            addImgClick(this.img, this.index);
+          }
+        }
+      }
+    }
+    //初始化
+    initImg();
+  </script>
+  
+  
+</body>
+
+</html>

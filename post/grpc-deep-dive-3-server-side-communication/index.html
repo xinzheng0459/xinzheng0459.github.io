@@ -1,0 +1,524 @@
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="ie=edge">
+<title>gRPC Deep Dive (3): Server Side Communication - zhengxin&#39;s blog</title>
+<link rel="shortcut icon" href="https://xinzheng0459.github.io/favicon.ico">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.2.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/animate.css@3.7.2/animate.min.css">
+<link rel="stylesheet" href="https://xinzheng0459.github.io/media/css/tailwind.css">
+<link rel="stylesheet" href="https://xinzheng0459.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="gRPC Deep Dive (3): Server Side Communication - zhengxin&#39;s blog - Atom Feed" href="https://xinzheng0459.github.io/atom.xml">
+
+    
+
+  <meta name="description" content="
+In the previous article, we learned how the gRPC server establishes an HTTP2 connection with the client, in this articl..." />
+  <meta property="og:title" content="gRPC Deep Dive (3): Server Side Communication - zhengxin&#39;s blog">
+  <meta property="og:description" content="
+In the previous article, we learned how the gRPC server establishes an HTTP2 connection with the client, in this articl..." />
+  <meta property="og:type" content="articles">
+  <meta property="og:url" content="https://xinzheng0459.github.io/post/grpc-deep-dive-3-server-side-communication/" />
+  <meta property="og:image" content="https://xinzheng0459.github.io/images/avatar.png">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:width" content="1200">
+  <meta name="twitter:title" content="gRPC Deep Dive (3): Server Side Communication - zhengxin&#39;s blog">
+  <meta name="twitter:description" content="
+In the previous article, we learned how the gRPC server establishes an HTTP2 connection with the client, in this articl...">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" href="https://xinzheng0459.github.io/post/grpc-deep-dive-3-server-side-communication/">
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.css">
+ 
+  
+    <link rel="stylesheet" href="https://xinzheng0459.github.io/media/css/prism-atom-dark.css">
+  
+
+  
+</head>
+
+<body>
+  <div class="antialiased flex flex-col min-h-screen" id="app">
+    <a href="https://xinzheng0459.github.io" class="fixed top-0 left-0 mt-4 bg-black text-white dark:text-gray-700 dark:bg-yellow-50 dark:hover:bg-black dark:hover:text-white inline-flex p-2 pl-8 hover:text-gray-700 hover:bg-yellow-50 font-bold z-10 transition-fast animated fadeInLeft">
+      zhengxin&#39;s blog
+    </a>
+    <div class="max-w-4xl w-full mx-auto">
+      <div class="shadow-box bg-white dark:bg-gray-600 rounded-lg pt-32 md:pt-64 px-4 md:px-8 pb-8 animated fadeIn mb-8">
+        <h1 class="text-5xl font-semibold leading-normal pb-8 mb-8 border-b-8 border-gray-700">
+          gRPC Deep Dive (3): Server Side Communication
+        </h1>
+        
+        <div class="mb-8 flex flex-wrap">
+          <div class="text-gray-400 text-sm mr-4">2022-07-10 · 9 min read</div>
+          
+        </div>
+        <div class="markdown mb-8" v-pre>
+          <figure data-type="image" tabindex="1"><img src="https://cncf-branding.netlify.app/img/projects/grpc/horizontal/color/grpc-horizontal-color.png" alt="gRPC icon" loading="lazy"></figure>
+<p>In the previous article, we learned how the gRPC server establishes an HTTP2 connection with the client, in this article, let's see what the gRPC server does after receiving an RPC request from the client.</p>
+<p>HTTP2 defines several types of frames, including <em>data</em>, <em>headers</em>, <em>settings</em>, <em>ping</em>, <em>goaway</em>, etc. For different frame types, the HTTP/2 server should have different processing logic.</p>
+<pre><code class="language-go">func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
+	if s.quit.HasFired() {
+		rawConn.Close()
+		return
+	}
+	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
+
+	// RPC 连接阶段, 完成 HTTP2 握手
+    // RPC initialization, HTTP/2 handshake
+	st := s.newHTTP2Transport(rawConn)
+	rawConn.SetDeadline(time.Time{})
+	if st == nil {
+		return
+	}
+
+	if !s.addConn(lisAddr, st) {
+		return
+	}
+	go func() {
+        // start RPC communication
+		s.serveStreams(st)
+		s.removeConn(lisAddr, st)
+	}()
+}
+</code></pre>
+<p>In gRPC, the classification and processing of frame types is contained in <code>s.serveStreams</code>.</p>
+<pre><code class="language-go">func (s *Server) serveStreams(st transport.ServerTransport) {
+	defer st.Close()
+	var wg sync.WaitGroup
+
+	var roundRobinCounter uint32
+    // block and receives frames from client
+	st.HandleStreams(func(stream *transport.Stream) {
+		wg.Add(1)
+		......
+		go func() {
+			defer wg.Done()
+            // when a new stream is created, do some configuration
+			s.handleStream(st, stream, s.traceInfo(st, stream))
+		}()
+	}, func(ctx context.Context, method string) context.Context {
+		if !EnableTracing {
+			return ctx
+		}
+		tr := trace.New(&quot;grpc.Recv.&quot;+methodFamily(method), method)
+		return trace.NewContext(ctx, tr)
+	})
+	wg.Wait()
+}
+</code></pre>
+<p><code>st.HandleStreams</code> blocks the current goroutine, and waits for a frame from the client.</p>
+<pre><code class="language-go">func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.Context, string) context.Context) {
+	defer close(t.readerDone)
+	for {
+		t.controlBuf.throttle()
+		frame, err := t.framer.fr.ReadFrame()
+		...
+		switch frame := frame.(type) {
+		case *http2.MetaHeadersFrame:
+			if t.operateHeaders(frame, handle, traceCtx) {
+				t.Close()
+				break
+			}
+		case *http2.DataFrame:
+			t.handleData(frame)
+		case *http2.RSTStreamFrame:
+			t.handleRSTStream(frame)
+		case *http2.SettingsFrame:
+			t.handleSettings(frame)
+		case *http2.PingFrame:
+			t.handlePing(frame)
+		case *http2.WindowUpdateFrame:
+			t.handleWindowUpdate(frame)
+		case *http2.GoAwayFrame:
+			// TODO: Handle GoAway from the client appropriately.
+		default:
+			if logger.V(logLevel) {
+				logger.Errorf(&quot;transport: http2Server.HandleStreams found unhandled frame type %v.&quot;, frame)
+			}
+		}
+	}
+}
+</code></pre>
+<p><code>st.HandleStreams</code> wait for and read frames from the client in a for loop, and handle them differently. In this article, we will take headers, data and settings frames as examples, and briefly describe how the gRPC server handles them.</p>
+<h1 id="header-frame">Header Frame</h1>
+<p>The functions that handle the Headers frame operateHeaders are long, so we'll take a look at them in sections.</p>
+<pre><code class="language-go">func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
+	......
+	streamID := frame.Header().StreamID
+	......
+	buf := newRecvBuffer()
+	s := &amp;Stream{
+		id:  streamID,
+		st:  t,
+		buf: buf,
+		fc:  &amp;inFlow{limit: uint32(t.initialWindowSize)},
+	}
+	......
+}
+</code></pre>
+<p>On the gRPC server and client sides, there is a concept of a stream that characterizes a gRPC call. A gRPC call always starts with a frame of headers from the client, so the server creates a stream object in the <code>operatorHeaders</code>, The stream has a consistent id on the client and server sides, and also has a <code>buf</code> cache. We will discuss the details of caching and flow control in a later chapter.</p>
+<pre><code class="language-go">func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
+	......
+	for _, hf := range frame.Fields {
+		switch hf.Name {
+		case &quot;content-type&quot;:
+			contentSubtype, validContentType := grpcutil.ContentSubtype(hf.Value)
+			if !validContentType {
+				break
+			}
+			mdata[hf.Name] = append(mdata[hf.Name], hf.Value)
+			s.contentSubtype = contentSubtype
+			isGRPC = true
+		case &quot;grpc-encoding&quot;:
+			s.recvCompress = hf.Value
+		case &quot;:method&quot;:
+			httpMethod = hf.Value
+		case &quot;:path&quot;:
+			s.method = hf.Value
+		case &quot;grpc-timeout&quot;:
+			timeoutSet = true
+			var err error
+			if timeout, err = decodeTimeout(hf.Value); err != nil {
+				headerError = true
+			}
+		// &quot;Transports must consider requests containing the Connection header
+		// as malformed.&quot; - A41
+		case &quot;connection&quot;:
+			if logger.V(logLevel) {
+				logger.Errorf(&quot;transport: http2Server.operateHeaders parsed a :connection header which makes a request malformed as per the HTTP/2 spec&quot;)
+			}
+			headerError = true
+		default:
+			if isReservedHeader(hf.Name) &amp;&amp; !isWhitelistedHeader(hf.Name) {
+				break
+			}
+			v, err := decodeMetadataHeader(hf.Name, hf.Value)
+			if err != nil {
+				headerError = true
+				logger.Warningf(&quot;Failed to decode metadata header (%q, %q): %v&quot;, hf.Name, hf.Value, err)
+				break
+			}
+			mdata[hf.Name] = append(mdata[hf.Name], v)
+		}
+	}
+	......
+}
+</code></pre>
+<p>The gRPC server will traverse the fields in the frame and record the information in the fields in the stream. It is worth noting that the <code>:method</code> and <code>:path</code> fields need to be filled in by the client to specify which remote procedure to call from the server. In other words, the information about which server method to call is in a separate frame from the parameters of the calling method.</p>
+<pre><code class="language-go">func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
+	......
+	t.activeStreams[streamID] = s
+	......
+	handle(s)
+	......
+}
+</code></pre>
+<p>The new stream object is placed in the server's <code>activeStreams</code> map, and <code>handle(s)</code> is called to further process the stream. <code>handle</code> will eventually trigger a call to <code>s.handleStream</code>.</p>
+<pre><code class="language-go">func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Stream, trInfo *traceInfo) {
+	sm := stream.Method()
+	......
+	service := sm[:pos]
+	method := sm[pos+1:]
+
+	srv, knownService := s.services[service]
+	if knownService {
+		if md, ok := srv.methods[method]; ok {
+			s.processUnaryRPC(t, stream, srv, md, trInfo)
+			return
+		}
+		if sd, ok := srv.streams[method]; ok {
+			s.processStreamingRPC(t, stream, srv, sd, trInfo)
+			return
+		}
+	}
+	......
+	if err := t.WriteStatus(stream, status.New(codes.Unimplemented, errDesc)); err != nil {
+		......
+	}
+	......
+}
+</code></pre>
+<p>Based on the path and method information in the headers frame, the gRPC server finds the registered method and executes it. Take <code>s.processUnaryRPC</code> as an example:</p>
+<pre><code class="language-go">func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.Stream, info *serviceInfo, md *MethodDesc, trInfo *traceInfo) (err error) {
+	......
+	d, err := recvAndDecompress(&amp;parser{r: stream}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
+	......
+	reply, appErr := md.Handler(info.serviceImpl, ctx, df, s.opts.unaryInt)
+	......
+	if err := s.sendResponse(t, stream, reply, cp, opts, comp); err != nil {
+		......
+	}
+	err = t.WriteStatus(stream, statusOK)
+	......
+}
+</code></pre>
+<p>Firstly, the data frames are read from the stream, i.e. the parameter information of the RPC method. <code>md.Handler</code> will execute the registered methods and send the reply to the client (not directly to the client, but by storing the data in a buffer and sending it to the <code>loopyWriter</code>. <code>WriteStatus</code> is executed at the end of a stream, which marks the end of the stream.</p>
+<h1 id="data-frame">Data Frame</h1>
+<pre><code class="language-go">func (t *http2Server) handleData(f *http2.DataFrame) {
+	......
+	// Select the right stream to dispatch.
+	s, ok := t.getStream(f)
+	if !ok {
+		return
+	}
+	......
+	if size &gt; 0 {
+		......
+		if len(f.Data()) &gt; 0 {
+			buffer := t.bufferPool.get()
+			buffer.Reset()
+			buffer.Write(f.Data())
+			s.write(recvMsg{buffer: buffer})
+		}
+	}
+	......
+}
+</code></pre>
+<p>When processing the data frame</p>
+<ol>
+<li>Based on streamId, find the stream object from the server's <code>activeStreams</code> map.</li>
+<li>Get a buffer from the <code>bufferPool</code> and write the data of the frame to the buffer.</li>
+<li>Save this buffer to the stream's <code>recvBuffer</code>.</li>
+</ol>
+<p>The data cached in the <code>recvBuffer</code> will eventually be read by the <code>recvAndDecompress</code> function mentioned above to reconstruct the RPC parameters on the server side.</p>
+<h1 id="settings-frame">Settings Frame</h1>
+<p>In addition to the headers frame and data frame necessary to complete a gRPC call, the server side may receive a setting frame from the client during the RPC interaction phase to update some of the HTTP2 parameters.</p>
+<pre><code class="language-go">func (t *http2Server) handleSettings(f *http2.SettingsFrame) {
+	......
+	var ss []http2.Setting
+	......
+	f.ForeachSetting(func(s http2.Setting) error {
+		switch s.ID {
+		......
+		default:
+			ss = append(ss, s)
+		}
+		return nil
+	})
+	t.controlBuf.executeAndPut(func(interface{}) bool {
+		for _, f := range updateFuncs {
+			f()
+		}
+		return true
+	}, &amp;incomingSettings{
+		ss: ss,
+	})
+}
+</code></pre>
+<p>handleSettings does not apply the settings frame parameters directly to the server, but puts them into the <code>controlBuf</code>, which will be covered in a later chapter.</p>
+<h1 id="summary">Summary</h1>
+<p>As you can see, the gRPC server is basically asynchronous throughout the processing flow, except for the execution of registered methods. The operations are connected together by buffer to avoid goroutine blocking to the maximum extent possible.</p>
+
+        </div>
+        <!-- Share to Twitter, Weibo, Telegram -->
+        <div class="flex items-center">
+          <div class="mr-4 flex items-center">
+            <i class="ri-share-forward-line text-gray-500"></i>
+          </div>
+          <div class="px-4 cursor-pointer text-blue-500 hover:bg-blue-100 dark:hover:bg-gray-600 inline-flex" @click="shareToTwitter">
+            <i class="ri-twitter-line"></i>
+          </div>
+          <div class="px-4 cursor-pointer text-red-500 hover:bg-red-100 dark:hover:bg-gray-600 inline-flex" @click="shareToWeibo">
+            <i class="ri-weibo-line"></i>
+          </div>
+          <div class="px-4 cursor-pointer text-indigo-500 hover:bg-indigo-100 dark:hover:bg-gray-600 inline-flex" @click="shareToTelegram">
+            <i class="ri-telegram-line"></i>
+          </div>
+        </div>
+      </div>
+
+      
+
+      
+
+      <footer class="py-12 text-center px-4 md:px-0" v-pre>
+  
+</footer>
+    </div>
+
+    <!-- TOC Container -->
+    <div class="fixed right-0 bottom-0 mb-16 mr-4 shadow w-8 h-8 rounded-full flex justify-center items-center z-10 cursor-pointer bg-white dark:bg-gray-500 dark:text-gray-200 hover:shadow-lg transition-all animated fadeInRight" @click="showToc = true">
+      <i class="ri-file-list-line"></i>
+    </div>
+
+    <div class="fixed right-0 top-0 bottom-0 overflow-y-auto w-64 bg-white dark:bg-gray-800 p-4 border-l border-gray-100 dark:border-gray-600 z-10 transition-fast" :class="{ '-mr-64': !showToc }">
+      <div class="flex mb-4 justify-end">
+        <div class="w-8 h-8 inline-flex justify-center items-center rounded-full cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-600 transition-fast" @click="showToc = false">
+          <i class="ri-close-line text-lg"></i>
+        </div>
+      </div>
+      <div class="post-toc-container">
+        <ul class="markdownIt-TOC">
+<li><a href="#header-frame">Header Frame</a></li>
+<li><a href="#data-frame">Data Frame</a></li>
+<li><a href="#settings-frame">Settings Frame</a></li>
+<li><a href="#summary">Summary</a></li>
+</ul>
+
+      </div>
+    </div>
+
+    <!-- Back to top -->
+    <div class="fixed right-0 bottom-0 mb-4 mr-4 shadow w-8 h-8 rounded-full flex justify-center items-center z-10 cursor-pointer bg-white hover:shadow-lg transition-all dark:bg-gray-500 dark:text-gray-200" @click="backToUp" v-show="scrolled">
+      <i class="ri-arrow-up-line"></i>
+    </div>
+  </div>
+
+  <!-- Root element of PhotoSwipe. Must have class pswp. -->
+<div class="pswp" tabindex="-1" role="dialog" aria-hidden="true">
+  <!-- Background of PhotoSwipe. 
+        It's a separate element as animating opacity is faster than rgba(). -->
+  <div class="pswp__bg">
+  </div>
+  <!-- Slides wrapper with overflow:hidden. -->
+  <div class="pswp__scroll-wrap">
+    <!-- Container that holds slides. 
+            PhotoSwipe keeps only 3 of them in the DOM to save memory.
+            Don't modify these 3 pswp__item elements, data is added later on. -->
+    <div class="pswp__container">
+      <div class="pswp__item">
+      </div>
+      <div class="pswp__item">
+      </div>
+      <div class="pswp__item">
+      </div>
+    </div>
+    <!-- Default (PhotoSwipeUI_Default) interface on top of sliding area. Can be changed. -->
+    <div class="pswp__ui pswp__ui--hidden">
+      <div class="pswp__top-bar">
+        <!--  Controls are self-explanatory. Order can be changed. -->
+        <div class="pswp__counter">
+        </div>
+        <button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+        <button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+        <button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button>
+        <!-- Preloader demo http://codepen.io/dimsemenov/pen/yyBWoR -->
+        <!-- element will get class pswp__preloader--active when preloader is running -->
+        <div class="pswp__preloader">
+          <div class="pswp__preloader__icn">
+            <div class="pswp__preloader__cut">
+              <div class="pswp__preloader__donut">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap">
+        <div class="pswp__share-tooltip">
+        </div>
+      </div>
+      <button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+      </button>
+      <button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)">
+      </button>
+      <div class="pswp__caption">
+        <div class="pswp__caption__center">
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/vue/dist/vue.js"></script>
+  <script src="https://xinzheng0459.github.io/media/scripts/main.js"></script>
+  
+  <!-- Code Highlight -->
+  
+    <script src="https://xinzheng0459.github.io/media/prism.js"></script>
+    <script>
+      Prism.highlightAll()
+    </script>
+  
+
+  <script src="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js"></script>
+  <script>
+    //拿到预览框架，也就是上面的html代码
+    var pswpElement = document.querySelectorAll('.pswp')[0];
+    //定义图片数组变量
+    var imgitems;
+    /**
+    * 用于显示预览界面
+    * @param index 图片数组下标
+    */
+    function viewImg(index) {
+      //其它选项这里不做过多阐述，详情见官网
+      var pswpoptions = {
+        index: parseInt(index, 10), // 开始幻灯片索引。0是第一张幻灯片。必须是整数，而不是字符串。
+        bgOpacity: 0.7, // 背景透明度，0-1
+        maxSpreadZoom: 3, // 缩放级别，不要太大
+      };
+      //初始化并打开PhotoSwipe，pswpElement对应上面预览框架，PhotoSwipeUI_Default为皮肤，imgitems为图片数组，pswpoptions为选项
+      var gallery = new PhotoSwipe(pswpElement, PhotoSwipeUI_Default, imgitems, pswpoptions);
+      gallery.init()
+    }
+    /**
+    * 用于添加图片点击事件
+    * @param img 图片元素
+    * @param index 所属下标（在imgitems中的位置）
+    */
+    function addImgClick(img, index) {
+      img.onclick = function() {
+        viewImg(index)
+      }
+    }
+    /**
+    * 轮询所有图片，获取src、width、height等数据，加入imgitems，并给图片元素添加事件
+    * 最好在onload中执行该方法，本站因放在最底部，所以直接初始化
+    * 异步加载图片可在图片元素创建完成后调用此方法
+    */
+    function initImg() {
+      //重置图片数组
+      imgitems = [];
+      //查找class:markdown 下的所有img元素并遍历
+      var imgs = document.querySelectorAll('.markdown img');
+      for (var i = 0; i < imgs.length; i++) {
+        var img = imgs[i];
+        //本站相册初始为loading图片，真实图片放在data-src
+        var ds = img.getAttribute("data-src");
+        //创建image对象，用于获取图片宽高
+        var imgtemp = new Image();
+        //判断是否存在data-src
+        if (ds != null && ds.length > 0) {
+          imgtemp.src = ds
+        } else {
+          imgtemp.src = img.src
+        }
+        //判断是否存在缓存
+        if (imgtemp.complete) {
+          var imgobj = {
+            "src": imgtemp.src,
+            "w": imgtemp.width,
+            "h": imgtemp.height,
+          };
+          imgitems[i] = imgobj;
+          addImgClick(img, i);
+        } else {
+          console.log('进来了2')
+          imgtemp.index = i;
+          imgtemp.img = img;
+          imgtemp.onload = function() {
+            var imgobj = {
+              "src": this.src,
+              "w": this.width,
+              "h": this.height,
+            };
+            //不要使用push，因为onload前后顺序会不同
+            imgitems[this.index] = imgobj
+            //添加点击事件
+            addImgClick(this.img, this.index);
+          }
+        }
+      }
+    }
+    //初始化
+    initImg();
+  </script>
+  
+  
+</body>
+
+</html>

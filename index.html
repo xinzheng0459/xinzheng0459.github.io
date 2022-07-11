@@ -1,0 +1,225 @@
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="ie=edge">
+<title>zhengxin&#39;s blog</title>
+<link rel="shortcut icon" href="https://xinzheng0459.github.io/favicon.ico">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.2.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/animate.css@3.7.2/animate.min.css">
+<link rel="stylesheet" href="https://xinzheng0459.github.io/media/css/tailwind.css">
+<link rel="stylesheet" href="https://xinzheng0459.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="zhengxin&#39;s blog - Atom Feed" href="https://xinzheng0459.github.io/atom.xml">
+
+    
+
+  <meta name="description" content="My technical summary and sharing" />
+</head>
+<body>
+  <div class="antialiased flex flex-col min-h-screen" id="app">
+
+    <div class="nav py-3 md:py-8 fixed w-full z-10 bg-gray-50 dark:bg-gray-700 transition-all duration-300" :class="{ 'scroll': scrolled }">
+  <div class="flex justify-end px-4">
+    <div class="w-8 h-8 flex justify-center items-center rounded-full md:hidden" @click="showMenu = !showMenu">
+      <i class="ri-close-line" v-show="showMenu"></i>
+      <i class="ri-menu-3-line" v-show="!showMenu"></i>
+    </div>
+  </div>
+  <nav class="max-w-4xl w-full mx-auto text-center flex flex-col md:flex-row justify-center md:block" :class="`${ showMenu ? 'block' : 'hidden' }`">
+    
+      <a href="/" target="" class="py-2 md:py-1 px-4 mx-4 inline-flex transition font-semibold rounded dark:hover:bg-gray-600 hover:bg-gray-200">
+        Home
+      </a>
+    
+      <a href="/archives" target="" class="py-2 md:py-1 px-4 mx-4 inline-flex transition font-semibold rounded dark:hover:bg-gray-600 hover:bg-gray-200">
+        Archive
+      </a>
+    
+      <a href="/tags" target="" class="py-2 md:py-1 px-4 mx-4 inline-flex transition font-semibold rounded dark:hover:bg-gray-600 hover:bg-gray-200">
+        Tags
+      </a>
+    
+      <a href="/post/about" target="" class="py-2 md:py-1 px-4 mx-4 inline-flex transition font-semibold rounded dark:hover:bg-gray-600 hover:bg-gray-200">
+        About
+      </a>
+    
+    <a href="https://xinzheng0459.github.io/atom.xml" target="_blank" class="py-2 md:py-1 px-4 mx-4 inline-flex transition font-semibold rounded dark:hover:bg-gray-600 hover:bg-gray-200">
+      RSS
+    </a>
+  </nav>
+</div>
+
+    <div class="max-w-4xl w-full mx-auto ">
+      
+        <header class="flex py-16 md:py-32 mt-12 flex-col md:flex-row px-4 md:px-0 animated fadeIn">
+  <div class="flex-1 order-2 md:order-1 md:pr-16">
+    <div class="text-4xl font-bold text-center md:text-left">
+      zhengxin&#39;s blog
+    </div>
+    <div class="text-xl text-gray-500 mt-4 text-center md:text-left">
+      My technical summary and sharing
+    </div>
+    
+    
+      <div class="mt-8 flex items-center">
+        
+          <div class="text-gray-500 mr-2">
+            Follow me 👉
+          </div>
+        
+        
+          
+        
+          
+        
+          
+            
+              <a href="https://github.com/xinzheng0459" target="_blank" class="mr-2 w-8 h-8 inline-flex items-center justify-center text-xl hover:bg-gray-200 dark:hover:bg-gray-600 transition-fast">
+                <i class="ri-github-line"></i>
+              </a>
+            
+          
+        
+          
+        
+          
+        
+          
+        
+          
+        
+          
+        
+          
+        
+          
+        
+          
+        
+          
+        
+      </div>
+    
+  </div>
+  <div class="md:mx-8 flex-shrink-0 self-start rounded-full border-4 border-dotted border-transparent hover:border-yellow-50 p-2 w-32 h-32 order-1 md:order-2 mx-auto s3-dotted">
+    <img class="rounded-full object-cover" src="https://xinzheng0459.github.io/images/avatar.png?v=1657547992907" alt="zhengxin&#39;s blog" width="100%" height="100%">
+  </div>
+</header>
+      
+
+      <div class="shadow-box bg-white dark:bg-gray-600 border-gray-300 rounded-none md:rounded-lg -mx-1 md:mx-0 md:px-0">
+        
+  <div class="p-8 border-b border-gray-200 dark:border-gray-700 flex relative overflow-hidden flex-col md:flex-row animated fadeIn">
+    
+    <div class="flex-1 order-2 md:order-1">
+      <h2 class="text-2xl font-semibold mb-4">
+        <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-5-flow-control/" class="text-gray-700 dark:text-gray-200 border-b-2 border-dotted border-gray-200 dark:border-gray-400 dark:hover:border-gray-200 hover:border-gray-600 transition-all duration-100">
+          gRPC Deep Dive (5): Flow Control
+        </a>
+      </h2>
+      <div class="mb-4 text-xs text-gray-500">2022-07-11</div>
+      <div class="mb-4 text-gray-500 dark:text-gray-300">
+        
+Flow control, in general, refers to a network transmission in which the sender actively limits the rate at which it sen...
+      </div>
+      <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-5-flow-control/" class="btn">
+        Read more
+      </a>
+    </div>
+    
+  </div>
+
+  <div class="p-8 border-b border-gray-200 dark:border-gray-700 flex relative overflow-hidden flex-col md:flex-row animated fadeIn">
+    
+    <div class="flex-1 order-2 md:order-1">
+      <h2 class="text-2xl font-semibold mb-4">
+        <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-4-framer/" class="text-gray-700 dark:text-gray-200 border-b-2 border-dotted border-gray-200 dark:border-gray-400 dark:hover:border-gray-200 hover:border-gray-600 transition-all duration-100">
+          gRPC Deep Dive (4): Framer
+        </a>
+      </h2>
+      <div class="mb-4 text-xs text-gray-500">2022-07-11</div>
+      <div class="mb-4 text-gray-500 dark:text-gray-300">
+        
+In the previous articles, we got an overview of how the gRPC server works. Starting with this article, let's take a loo...
+      </div>
+      <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-4-framer/" class="btn">
+        Read more
+      </a>
+    </div>
+    
+  </div>
+
+  <div class="p-8 border-b border-gray-200 dark:border-gray-700 flex relative overflow-hidden flex-col md:flex-row animated fadeIn">
+    
+    <div class="flex-1 order-2 md:order-1">
+      <h2 class="text-2xl font-semibold mb-4">
+        <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-3-server-side-communication/" class="text-gray-700 dark:text-gray-200 border-b-2 border-dotted border-gray-200 dark:border-gray-400 dark:hover:border-gray-200 hover:border-gray-600 transition-all duration-100">
+          gRPC Deep Dive (3): Server Side Communication
+        </a>
+      </h2>
+      <div class="mb-4 text-xs text-gray-500">2022-07-10</div>
+      <div class="mb-4 text-gray-500 dark:text-gray-300">
+        
+In the previous article, we learned how the gRPC server establishes an HTTP2 connection with the client, in this articl...
+      </div>
+      <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-3-server-side-communication/" class="btn">
+        Read more
+      </a>
+    </div>
+    
+  </div>
+
+  <div class="p-8 border-b border-gray-200 dark:border-gray-700 flex relative overflow-hidden flex-col md:flex-row animated fadeIn">
+    
+    <div class="flex-1 order-2 md:order-1">
+      <h2 class="text-2xl font-semibold mb-4">
+        <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-2-server-initialization/" class="text-gray-700 dark:text-gray-200 border-b-2 border-dotted border-gray-200 dark:border-gray-400 dark:hover:border-gray-200 hover:border-gray-600 transition-all duration-100">
+          gRPC Deep Dive (2): Server Initialization
+        </a>
+      </h2>
+      <div class="mb-4 text-xs text-gray-500">2022-07-10</div>
+      <div class="mb-4 text-gray-500 dark:text-gray-300">
+        
+When a gRPC client sends a request to a gRPC server, the interaction between the client and the server can be roughly d...
+      </div>
+      <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-2-server-initialization/" class="btn">
+        Read more
+      </a>
+    </div>
+    
+  </div>
+
+  <div class="p-8 border-b border-gray-200 dark:border-gray-700 flex relative overflow-hidden flex-col md:flex-row animated fadeIn">
+    
+    <div class="flex-1 order-2 md:order-1">
+      <h2 class="text-2xl font-semibold mb-4">
+        <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-1-overview/" class="text-gray-700 dark:text-gray-200 border-b-2 border-dotted border-gray-200 dark:border-gray-400 dark:hover:border-gray-200 hover:border-gray-600 transition-all duration-100">
+          gRPC Deep Dive (1): Overview
+        </a>
+      </h2>
+      <div class="mb-4 text-xs text-gray-500">2022-07-10</div>
+      <div class="mb-4 text-gray-500 dark:text-gray-300">
+        
+gRPC Deep Dive is a series of articles documenting some understanding and discoveries while reading, studying and using...
+      </div>
+      <a href="https://xinzheng0459.github.io/post/grpc-deep-dive-1-overview/" class="btn">
+        Read more
+      </a>
+    </div>
+    
+  </div>
+  
+      </div>
+
+      
+      <footer class="py-12 text-center px-4 md:px-0" v-pre>
+  
+</footer>
+
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/vue/dist/vue.js"></script>
+  <script src="https://xinzheng0459.github.io/media/scripts/main.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,1254 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://xinzheng0459.github.io</id>
+    <title>zhengxin&apos;s blog</title>
+    <updated>2022-07-11T13:59:55.266Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://xinzheng0459.github.io"/>
+    <link rel="self" href="https://xinzheng0459.github.io/atom.xml"/>
+    <subtitle>My technical summary and sharing</subtitle>
+    <logo>https://xinzheng0459.github.io/images/avatar.png</logo>
+    <icon>https://xinzheng0459.github.io/favicon.ico</icon>
+    <rights>All rights reserved 2022, zhengxin&apos;s blog</rights>
+    <entry>
+        <title type="html"><![CDATA[gRPC Deep Dive (5): Flow Control]]></title>
+        <id>https://xinzheng0459.github.io/post/grpc-deep-dive-5-flow-control/</id>
+        <link href="https://xinzheng0459.github.io/post/grpc-deep-dive-5-flow-control/">
+        </link>
+        <updated>2022-07-11T13:21:32.000Z</updated>
+        <content type="html"><![CDATA[<figure data-type="image" tabindex="1"><img src="https://cncf-branding.netlify.app/img/projects/grpc/horizontal/color/grpc-horizontal-color.png" alt="gRPC icon" loading="lazy"></figure>
+<p>Flow control, in general, refers to a network transmission in which the sender actively limits the rate at which it sends data or the amount of data it sends to match the speed at which the receiver processes the data. When the receiver's processing speed is slow, the data that is too slow to be processed is stored in memory, and when the data buffer in memory is filled, the newly received data is thrown away, causing the sender to retransmit, resulting in a waste of network bandwidth.</p>
+<p>flow control is a basic function of a network component, and the TCP protocol, as we know it, specifies the flow control algorithm. gRPC is built on top of TCP and also relies on the HTTP/2 <code>WindowUpdate</code> frame to implement its own flow control at the application layer.</p>
+<p>In gRPC, flow control is embodied in three dimensions:</p>
+<ol>
+<li>Sampling flow control: The gRCP receiver detects the amount of data received over a period of time, inferring the amount of on-wire data, and directs the sender to adjust the flow control window.</li>
+<li>Connection level flow control: The sender is assigned a quota (quota) at initialization, which decreases as data is sent and increases after receiving feedback from the receiver. The sender cannot send any more data after the quota is exhausted.</li>
+<li>Stream level flow control: Similar to connection level flow control, except that connection level manages all traffic between a sender and a receiver, while stream level manages one of the many streams in a connection.</li>
+</ol>
+<p>In the rest of this article, we will take a look at the principles and implementation details of these three types of flow control in conjunction with the code.</p>
+<blockquote>
+<p>Flow control is bi-directional, and to reduce redundancy, in this article we only describe how gRPC controls the traffic sent by the server.<br>
+Flow control in gRPC is only for HTTP/2 data frames.</p>
+</blockquote>
+<h1 id="sampling-flow-control">Sampling flow control</h1>
+<h2 id="concepts">Concepts</h2>
+<p>Sampled Flow Control, or <strong>BDP Estimation and Dynamic Flow Control Window</strong> to be exact, is a flow control method that collects data on the receiving end to determine the size of the flow control window on the sending end. Refer to <a href="https://grpc.io/blog/grpc-go-perf-improvements/">gRPC-Go performance Improvements</a>.</p>
+<blockquote>
+<p>This feature is the latest and in some ways the most awaited optimization feature that has helped us close the final gap between gRPC and HTTP/1.1 performance on high latency networks.<br>
+Bandwidth Delay Product (BDP) is the bandwidth of a network connection times its round-trip latency. This effectively tells us how many bytes can be “on the wire” at a given moment, if full utilization is achieved.<br>
+The algorithm to compute BDP and adapt accordingly was first proposed by @ejona and later implemented by both gRPC-C core and gRPC-Java (note that it isn’t enabled in Java yet). The idea is simple and powerful: every time a receiver gets a data frame it sends out a BDP ping (a ping with unique data only used by BDP estimator). After this, the receiver starts counting the number of bytes it receives (including the ones that triggered the BDP ping) until it receives the ack for that ping. This total sum of all bytes received in about 1.5 RTT (Round-Trip Time) is an approximation of the effective BDP * 1.5. If this is close to our current window size (say, more than 2/3rd of it) we must increase the window size. We put our window sizes (both streaming and connection) to be twice the BDP we sampled(total sum of all bytes received).</p>
+</blockquote>
+<p>BDP sampling is currently enabled by default on the server side of gRPC-go.</p>
+<p>Let's take a look at the code and see how it is implemented.</p>
+<h2 id="codes">Codes</h2>
+<p>Let's take the example of a client sending a BDP ping to a server, and determining the flow control window on the server side.</p>
+<p>There is a <code>bdpEstimator</code> defined in gRPC-go , which is the core of the BDP calculation:</p>
+<pre><code class="language-go">type bdpEstimator struct {
+	// sentAt is the time when the ping was sent.
+	sentAt time.Time
+
+	mu sync.Mutex
+	// bdp is the current bdp estimate.
+	bdp uint32
+	// sample is the number of bytes received in one measurement cycle.
+	sample uint32
+	// bwMax is the maximum bandwidth noted so far (bytes/sec).
+	bwMax float64
+	// bool to keep track of the beginning of a new measurement cycle.
+	isSent bool
+	// Callback to update the window sizes.
+	updateFlowControl func(n uint32)
+	// sampleCount is the number of samples taken so far.
+	sampleCount uint64
+	// round trip time (seconds)
+	rtt float64
+}
+</code></pre>
+<p><code>bdpEstimator</code> has two main methods <code>add</code> and <code>calculate</code>:</p>
+<pre><code class="language-go">// the return value of `add` is used to determine whether to send a BDP ping frame to the server.
+func (b *bdpEstimator) add(n uint32) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+    // if bdp is already at the max, don't send a BDP ping to the server.
+	if b.bdp == bdpLimit {
+		return false
+	}
+    // if we haven't sent a BDP ping yet, we should send one.
+	if !b.isSent {
+		b.isSent = true
+		b.sample = n
+		b.sentAt = time.Time{}
+		b.sampleCount++
+		return true
+	}
+    // if we have sent a BDP ping, but haven't received an ACK yet, we should send one.
+	b.sample += n
+	return false
+}
+</code></pre>
+<p>The <code>add</code> function has two functionatilies:</p>
+<ol>
+<li>Determines whether the client starts sampling when it receives data.</li>
+<li>It records the time when sampling starts and the initial amount of data.</li>
+</ol>
+<pre><code class="language-go">func (t *http2Client) handleData(f *http2.DataFrame) {
+size := f.Header().Length
+	var sendBDPPing bool
+	if t.bdpEst != nil {
+		sendBDPPing = t.bdpEst.add(size)
+	}
+	......
+	if sendBDPPing {
+		......
+		t.controlBuf.put(bdpPing)
+	}
+	......
+}
+
+var bdpPing = &amp;ping{data: [8]byte{2, 4, 16, 16, 9, 14, 7, 7}}
+</code></pre>
+<p>The <code>handleData</code> function is a function that the gRPC client executes after it receives an HTTP/2 data frame from a server, from which we can see:</p>
+<p>gRPC client and each server maintain a <code>bdpEstimator</code> .<br>
+Each time a data frame is received, the gRPC client determines whether it needs to sample it. At the same time, the same client will only sample once.<br>
+If sampling is required, a bdpPing frame is sent to the client.</p>
+<p>After the Server side receives a bdpPing frame, it will immediately return a ping frame and flag the ACK, and the server will capture the ACK:</p>
+<pre><code class="language-go">func (t *http2Client) handlePing(f *http2.PingFrame) {
+	if f.IsAck() {
+		......
+		if t.bdpEst != nil {
+			t.bdpEst.calculate(f.Data)
+		}
+		return
+	}
+	......
+}
+</code></pre>
+<p>Server calls <code>handlePing</code> when it receives a HTTP/2 ping frame, and when that ping frame contains the ACK flag, <code>calculate</code> will be triggered.</p>
+<pre><code class="language-go">func (b *bdpEstimator) calculate(d [8]byte) {
+	// Check if the ping acked for was the bdp ping.
+	if bdpPing.data != d {
+		return
+	}
+	b.mu.Lock()
+	rttSample := time.Since(b.sentAt).Seconds()
+	if b.sampleCount &lt; 10 {
+		// Bootstrap rtt with an average of first 10 rtt samples.
+		b.rtt += (rttSample - b.rtt) / float64(b.sampleCount)
+	} else {
+		// Heed to the recent past more.
+		b.rtt += (rttSample - b.rtt) * float64(alpha)
+	}
+	b.isSent = false
+	// The number of bytes accumulated so far in the sample is smaller
+	// than or equal to 1.5 times the real BDP on a saturated connection.
+	bwCurrent := float64(b.sample) / (b.rtt * float64(1.5))
+	if bwCurrent &gt; b.bwMax {
+		b.bwMax = bwCurrent
+	}
+	// If the current sample (which is smaller than or equal to the 1.5 times the real BDP) is
+	// greater than or equal to 2/3rd our perceived bdp AND this is the maximum bandwidth seen so far, we
+	// should update our perception of the network BDP.
+	if float64(b.sample) &gt;= beta*float64(b.bdp) &amp;&amp; bwCurrent == b.bwMax &amp;&amp; b.bdp != bdpLimit {
+		sampleFloat := float64(b.sample)
+		b.bdp = uint32(gamma * sampleFloat)
+		if b.bdp &gt; bdpLimit {
+			b.bdp = bdpLimit
+		}
+		bdp := b.bdp
+		b.mu.Unlock()
+		b.updateFlowControl(bdp)
+		return
+	}
+	b.mu.Unlock()
+}
+</code></pre>
+<p>In <code>calculate</code>, the current bdp value is obtained after a series of calculations, and if the flow control needs to be updated, the <code>updateFlowControl</code> function registered in the <code>bdpEstimator</code> is called and the new window size is passed in.</p>
+<p>So how is the new window size handled in <code>updateFlowControl</code>?</p>
+<pre><code class="language-go">// updateFlowControl updates the incoming flow control windows
+// for the transport and the stream based on the current bdp
+// estimation.
+func (t *http2Server) updateFlowControl(n uint32) {
+	t.mu.Lock()
+	for _, s := range t.activeStreams {
+		s.fc.newLimit(n)
+	}
+	t.initialWindowSize = int32(n)
+	t.mu.Unlock()
+	t.controlBuf.put(&amp;outgoingWindowUpdate{
+		streamID:  0,
+		increment: t.fc.newLimit(n),
+	})
+	t.controlBuf.put(&amp;outgoingSettings{
+		ss: []http2.Setting{
+			{
+				ID:  http2.SettingInitialWindowSize,
+				Val: n,
+			},
+		},
+	})
+
+}
+</code></pre>
+<p>It is important to note that BDP sampling results affect the window size of HTTP/2, the window size of connection level, and the window size of stream level. The effect of BDP on gRPC is dynamic and comprehensive.</p>
+<h1 id="connection-flow-control">Connection Flow Control</h1>
+<h2 id="concepts-2">Concepts</h2>
+<p>In gRPC, a TCP connection is maintained between each client and server pair, and connection level flow control is targeted at this unique connection. At the beginning of the connection, the server is assigned a traffic quota, which defaults to 65535 bytes. flow control revolves around this quota:</p>
+<ol>
+<li>When the server sends <code>n</code> bytes of data to the client, <code>quota -= n</code></li>
+<li>When the server receives an HTTP/2 WindowUpdate Frame (henceforth window update) from the client, <code>quota += m</code>, based on the value <code>m</code> specified in the window update</li>
+<li>When the server's quota is 0, the server will not be able to send any data to the client.</li>
+</ol>
+<p>In order to control the traffic on the server side, the client side is assigned a limit at connection initialization, which is 65535 bytes by default. When the <code>unacked</code> exceeds a quarter of the limit, the client sends a window update (with the value of <code>unacked</code>) to the server to inform it that it can add back the quota and reset the <code>unacked</code> to zero.</p>
+<p>You can see that in order to avoid sending windows update frequently and consuming network bandwidth, the client does not send window update every time it receives data, but waits until the amount of data received reaches a certain threshold. Note that the limit * 1/4 threshold is not modifiable.</p>
+<h2 id="codes-2">Codes</h2>
+<h3 id="server-side">Server Side</h3>
+<pre><code class="language-go">type loopyWriter struct {
+	......
+    // quota that server has left to send on a single connection
+	sendQuota uint32
+	......
+}
+</code></pre>
+<p>On the server side, the quota is expressed as <code>sendQuota</code> .</p>
+<pre><code class="language-go">func (l *loopyWriter) processData() (bool, error) {
+    // if sendQuota is 0, do not send any data
+	if l.sendQuota == 0 {
+		return true, nil
+	}
+	......
+}
+</code></pre>
+<p>When <code>sendQuota</code> is 0, the server does not send data.</p>
+<pre><code class="language-go">// incomingWindowUpdateHandler is called when the server receives a window update frame from the client.
+func (l *loopyWriter) incomingWindowUpdateHandler(w *incomingWindowUpdate) error {
+	if w.streamID == 0 {
+		// add quota
+		l.sendQuota += w.increment
+		return nil
+	}
+	......
+}
+</code></pre>
+<p><code>sendQuota</code> is increased after receiving a window update from the client.</p>
+<pre><code class="language-go">func (l *loopyWriter) processData() (bool, error) {
+	......
+    // reduce sendQuota by the amount of data sent
+	l.sendQuota -= uint32(size)
+	......
+}
+</code></pre>
+<p>And the server will reduce <code>sendQuota</code> when sending data .</p>
+<h3 id="client-side">Client Side</h3>
+<pre><code class="language-go">// trInFlow is the core of the client side flow control.
+type trInFlow struct {
+    // server quota
+	limit               uint32
+    // data received by the client but ack not yet sent to the server
+	unacked             uint32
+}
+</code></pre>
+<p><code>trInFlow</code> is the core of client-side control over whether to send window updates. It is important to note that whether the client side sends a window update depends only on the amount of data already received, regardless of whether that data is read by some stream. This is an optimization of gRPC in flow control, i.e. because multiple streams share the same connection, it should not affect the flow control at the connection level because one stream is slow to read data, affecting other streams.</p>
+<pre><code class="language-go">// n represents the number of bytes received by the client, and the return value is the number of bytes that need to be sent to the server.
+// If the return value is 0, the client does not need to send a window update.
+func (f *trInFlow) onData(n uint32) uint32 {
+	f.unacked += n
+    // if the client has received more than 1/4 of the server's quota, it should send a window update.
+	if f.unacked &gt;= f.limit/4 {
+		w := f.unacked
+		f.unacked = 0
+		f.updateEffectiveWindowSize()
+		return w
+	}
+	f.updateEffectiveWindowSize()
+	return 0
+}
+</code></pre>
+<p>The <code>limit * 1/4</code> limit can actually be floated, because the limit value will change with the window update sent from the server.</p>
+<h1 id="stream-flow-control">Stream Flow Control</h1>
+<h2 id="concepts-3">Concepts</h2>
+<p>Stream level flow control and connection level flow control are basically the same, with two main differences:</p>
+<ol>
+<li>The quota in stream level flow control is only for a single stream. Each stream is subject to both stream level flow control and connection level flow control.</li>
+<li>The timing of the feedback to the server window update frame is a bit more complicated on the client side.</li>
+</ol>
+<p>Stream level flow control not only keeps track of the amount of data received, but also the amount of data consumed by the stream to achieve more accurate flow control. In fact, the client will record:</p>
+<ol>
+<li><strong>pendingData</strong>: the amount of data received by the stream that has not yet been consumed (not read) by the application.</li>
+<li><strong>pendingUpdate</strong>: The amount of data received by the stream that has already been consumed (read) by the application.</li>
+<li><strong>limit</strong>: The maximum amount of data the stream can accept, which is initially set to 65535 bytes, subject to sample flow control.</li>
+<li><strong>delta</strong>: delta is the amount of data added to the limit, when the application tries to read more data than the limit, delta is temporarily added to the limit to allow the application to read the data.</li>
+</ol>
+<figure data-type="image" tabindex="2"><img src="https://xinzheng0459.github.io/post-images/gRPC_Deep_Dive/stream_level_flow_control.png" alt="stream level flow control" loading="lazy"></figure>
+<p>The logic on the Client side looks like this:</p>
+<ul>
+<li>
+<p>Whenever the client receives a data frame from the server, <code>pendingData</code> += <code>the amount of data received</code>.</p>
+</li>
+<li>
+<p>Whenever the application reads data from the stream (i.e., when the pendingData will be consumed), the client knows that it should be able to read <code>n</code> bytes of data because the size of the data frame is sent to the client in advance in the headers frame. The client side will try to estimate the quota on the server side at this point, by:</p>
+<ul>
+<li>Since the client knows that the total amount of data received by the server is <code>pendingData + pendingUpdate</code>, the maximum value of the quota remaining on the server can be estimated as <code>limit - (pendingData + pendingUpdate)</code>. The reason why we can only estimate the maximum value is that the client cannot know exactly how much data the server has sent but the client has not yet received.</li>
+<li>Since the client knows that it should be able to read <code>n</code> bytes of data, the maximum value of data not yet sent by the server can be inferred to be <code>n - pendingData</code>, and similarly, since it does not know how much data is being transmitted over the network, the maximum value can only be inferred.</li>
+<li>Then if the server is still sending the maximum amount of data, which is larger than the maximum amount of the server's remaining quota, it means that the client has to send a window update to the server to temporarily increase the server's quota limit in order for the server to send the data. How much should be raised? The gRPC client chooses to raise the server's quota by <code>n</code> bytes. And record this <code>n</code> value in <code>delta</code>.</li>
+<li></li>
+</ul>
+<p>This logic ensures that the server does not stall when sending a large amount of data in one data frame transfer because the quota limit is too low.</p>
+<p>Note that the application is not actually reading data from the stream until now. All of the above adjustments happen before the read, which is equivalent to warming up the data before it is read.</p>
+</li>
+<li>
+<p>Whenever the application actually reads <code>n</code> bytes of data from the stream, the client needs to measure again whether it needs to send a window update to the server to update the server's quota:</p>
+<ul>
+<li><code>pendingData -= n</code></li>
+<li>Compare the size of the data to be read, <code>n</code>, with <code>delta</code>, and try to offset <code>delta</code>. This is done because the <code>delta</code> value is an additional temporary quota increase, and since so much data has already been added to the quota on the server side, the client does not need to send a window update to the server for this data. All this is to gradually eliminate the quota that was added temporarily to allow the server to send large amounts of data.</li>
+</ul>
+</li>
+</ul>
+<pre><code class="language-go">if n &gt; delta {
+	n -= delta
+	delta = 0
+} else {
+	delta -= n
+	n = 0
+}
+</code></pre>
+<ul>
+<li>After offsetting with delta, <code>n</code> is added to <code>pendingUpdate</code>, which means that <code>n</code> bytes of data will be read on the stream and no feedback will be sent to the server. When the size of this data exceeds the <code>limit * 1/4</code>, a window update is sent to the server, and the quota is increased by the amount of <code>pendingUpdate</code>.</li>
+<li>Clear <code>pendingUpdate</code> to 0.</li>
+</ul>
+<p>As we can see from the above analysis, the stream level also needs to sum the speed of the application reading data from the stream in order to better control the traffic on the stream. And gRPC also adds an extra value of <code>delta</code> for this purpose to avoid stream blocking due to traffic control.</p>
+<h2 id="codes-3">Codes</h2>
+<pre><code class="language-go">// inFlow deals with inbound flow control
+type inFlow struct {
+	mu sync.Mutex
+	// The inbound flow control limit for pending data.
+	limit uint32
+	// pendingData is the overall data which have been received but not been
+	// consumed by applications.
+	pendingData uint32
+	// The amount of data the application has consumed but grpc has not sent
+	// window update for them. Used to reduce window update frequency.
+	pendingUpdate uint32
+	// delta is the extra window update given by receiver when an application
+	// is reading data bigger in size than the inFlow limit.
+	delta uint32
+}
+
+// newLimit updates the inflow window to a new value n.
+// It assumes that n is always greater than the old limit.
+func (f *inFlow) newLimit(n uint32) {
+	f.mu.Lock()
+	f.limit = n
+	f.mu.Unlock()
+}
+
+func (f *inFlow) maybeAdjust(n uint32) uint32 {
+	if n &gt; uint32(math.MaxInt32) {
+		n = uint32(math.MaxInt32)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// estSenderQuota is the receiver's view of the maximum number of bytes the sender
+	// can send without a window update.
+	estSenderQuota := int32(f.limit - (f.pendingData + f.pendingUpdate))
+	// estUntransmittedData is the maximum number of bytes the sends might not have put
+	// on the wire yet. A value of 0 or less means that we have already received all or
+	// more bytes than the application is requesting to read.
+	estUntransmittedData := int32(n - f.pendingData) // Casting into int32 since it could be negative.
+	// This implies that unless we send a window update, the sender won't be able to send all the bytes
+	// for this message. Therefore we must send an update over the limit since there's an active read
+	// request from the application.
+	if estUntransmittedData &gt; estSenderQuota {
+		// Sender's window shouldn't go more than 2^31 - 1 as specified in the HTTP spec.
+		if f.limit+n &gt; maxWindowSize {
+			f.delta = maxWindowSize - f.limit
+		} else {
+			// Send a window update for the whole message and not just the difference between
+			// estUntransmittedData and estSenderQuota. This will be helpful in case the message
+			// is padded; We will fallback on the current available window(at least a 1/4th of the limit).
+			f.delta = n
+		}
+		return f.delta
+	}
+	return 0
+}
+
+// onData is invoked when some data frame is received. It updates pendingData.
+func (f *inFlow) onData(n uint32) error {
+	f.mu.Lock()
+	f.pendingData += n
+	if f.pendingData+f.pendingUpdate &gt; f.limit+f.delta {
+		limit := f.limit
+		rcvd := f.pendingData + f.pendingUpdate
+		f.mu.Unlock()
+		return fmt.Errorf(&quot;received %d-bytes data exceeding the limit %d bytes&quot;, rcvd, limit)
+	}
+	f.mu.Unlock()
+	return nil
+}
+
+// onRead is invoked when the application reads the data. It returns the window size
+// to be sent to the peer.
+func (f *inFlow) onRead(n uint32) uint32 {
+	f.mu.Lock()
+	if f.pendingData == 0 {
+		f.mu.Unlock()
+		return 0
+	}
+	f.pendingData -= n
+	if n &gt; f.delta {
+		n -= f.delta
+		f.delta = 0
+	} else {
+		f.delta -= n
+		n = 0
+	}
+	f.pendingUpdate += n
+	if f.pendingUpdate &gt;= f.limit/4 {
+		wu := f.pendingUpdate
+		f.pendingUpdate = 0
+		f.mu.Unlock()
+		return wu
+	}
+	f.mu.Unlock()
+	return 0
+}
+</code></pre>
+<h1 id="summary">Summary</h1>
+<p>This article carefully analyzes the traffic control strategy in gRPC-go, and provides some inspiration for developing programs with similar functionality. We also hope that we can gain a deeper understanding of gRPC after understanding the internal implementation of gRPC.</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[gRPC Deep Dive (4): Framer]]></title>
+        <id>https://xinzheng0459.github.io/post/grpc-deep-dive-4-framer/</id>
+        <link href="https://xinzheng0459.github.io/post/grpc-deep-dive-4-framer/">
+        </link>
+        <updated>2022-07-11T12:41:19.000Z</updated>
+        <content type="html"><![CDATA[<figure data-type="image" tabindex="1"><img src="https://cncf-branding.netlify.app/img/projects/grpc/horizontal/color/grpc-horizontal-color.png" alt="gRPC icon" loading="lazy"></figure>
+<p>In the previous articles, we got an overview of how the gRPC server works. Starting with this article, let's take a look at some of the design details of the gRPC server.<br>
+Regardless of how the gRPC server is designed, it will eventually send the results of the RPC execution to the client in the form of HTTP/2 frames. This article will dig into its implementation.</p>
+<h1 id="framer-in-server">Framer in Server</h1>
+<p>Each time the gRPC server receives a new connection from a client, it creates a Framer, <code>which</code> is actually the interface responsible for sending and receiving HTTP2 frames. The <code>Framer</code> is responsible for sending and receiving the frames for that particular client, regardless of the underlying streams.</p>
+<figure data-type="image" tabindex="2"><a href="https://mermaid.live/edit#pako:eNp1kMEOgjAMhl9l6QkSOICedjBR0RfA4y6VFSEyIGWYGMK7OwVM1LhT939f07QDZI0mkHBhbAtxSlQt3MvQ21cl1VZsfRGGG9F5KfGN2J_5eeG7mU959_rkkXdkNG97TuPPNI-mTsuRl1omND8g_gLxAlb_wHoBEIAbZbDUbrnhqSmwBRlSIF2pka8KVD06r281Wjro0jYMMseqowCwt016rzOQlntapKREdygzW-MDkzNfZw"><img src="https://mermaid.ink/img/pako:eNp1kMEOgjAMhl9l6QkSOICedjBR0RfA4y6VFSEyIGWYGMK7OwVM1LhT939f07QDZI0mkHBhbAtxSlQt3MvQ21cl1VZsfRGGG9F5KfGN2J_5eeG7mU959_rkkXdkNG97TuPPNI-mTsuRl1omND8g_gLxAlb_wHoBEIAbZbDUbrnhqSmwBRlSIF2pka8KVD06r281Wjro0jYMMseqowCwt016rzOQlntapKREdygzW-MDkzNfZw" alt="" loading="lazy"></a></figure>
+<pre><code class="language-go">type framer struct {
+    // a writer that writes to a net.Conn
+	writer *bufWriter
+    // native http2.Framer, responsible for data reading and writing
+	fr     *http2.Framer
+}
+</code></pre>
+<p><code>Framer</code> is actually a wrapper around golang's native <code>http2.Framer</code>.</p>
+<pre><code class="language-go">type bufWriter struct {
+	buf       []byte
+	offset    int
+	batchSize int
+	conn      net.Conn
+	err       error
+
+	onFlush func()
+}
+
+func newBufWriter(conn net.Conn, batchSize int) *bufWriter {
+	return &amp;bufWriter{
+		buf:       make([]byte, batchSize*2),
+		batchSize: batchSize,
+		conn:      conn,
+	}
+}
+
+func (w *bufWriter) Write(b []byte) (n int, err error) {
+    // check if the last write failed
+	if w.err != nil {
+		return 0, w.err
+	}
+    // if batchSize is 0, we don't need to write to the buffer, just write to the net.Conn
+	if w.batchSize == 0 { // Buffer has been disabled.
+		return w.conn.Write(b)
+	}
+    // If the length of the data to be written is greater than the remaining space in the buffer,
+    // we need to flush the buffer before writing to it.
+	for len(b) &gt; 0 {
+		nn := copy(w.buf[w.offset:], b)
+		b = b[nn:]
+		w.offset += nn
+		n += nn
+        // If the length of the data to be written is greater than the remaining space in the buffer,
+		if w.offset &gt;= w.batchSize {
+			err = w.Flush()
+		}
+	}
+	return n, err
+}
+
+// flush the buffer to the net.Conn
+func (w *bufWriter) Flush() error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.offset == 0 {
+		return nil
+	}
+	if w.onFlush != nil {
+		w.onFlush()
+	}
+	_, w.err = w.conn.Write(w.buf[:w.offset])
+	w.offset = 0
+	return w.err
+}
+</code></pre>
+<p>gRPC server implements a simple write cache in <code>http_util.go</code>, which is used by <code>http2.framer</code> as <code>io.Writer</code>.</p>
+<pre><code class="language-go">func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderListSize uint32) *framer {
+	if writeBufferSize &lt; 0 {
+		writeBufferSize = 0
+	}
+	var r io.Reader = conn
+	if readBufferSize &gt; 0 {
+		r = bufio.NewReaderSize(r, readBufferSize)
+	}
+	w := newBufWriter(conn, writeBufferSize)
+	f := &amp;framer{
+		writer: w,
+		fr:     http2.NewFramer(w, r),
+	}
+	......
+
+	return f
+}
+</code></pre>
+<p>The <code>io.Reader</code> passed to <code>http2.framer</code> uses a <code>bufio.Reader</code> as the underlying implementation.</p>
+<h1 id="send-data-from-server">Send Data from Server</h1>
+<p>The gRPC server creates a <code>loopyWriter</code> for each client, and the <code>loopyWriter</code> is responsible for sending the data to the client.</p>
+<pre><code class="language-go">type loopyWriter struct {
+	......
+	cbuf      *controlBuffer
+	......
+    // estdStreams stores all the streams that haven't received headers frame yet.
+	estdStreams map[uint32]*outStream // Established streams.
+    // activeStreams is a list of streams, where each stream is a list of data items.
+	activeStreams *outStreamList
+    // framer that writes to the underlying connection
+	framer        *framer
+	......
+}
+</code></pre>
+<figure data-type="image" tabindex="3"><img src="https://xinzheng0459.github.io/post-images/gRPC_Deep_Dive/activeStreams.png" alt="activeStreams" loading="lazy"></figure>
+<p>The <code>loopyWriter</code> coordinates internal <code>controlBuffer</code> and <code>activeStreams</code> at runtime to send data in an orderly fashion, roughly as follows:</p>
+<ol>
+<li><code>loopyWriter</code> reads the next message to be sent to the client from the <code>controlBuffer</code> corresponding to the client. <code>controlBuffer</code> may hold a variety of messages, including but not limited to dataFrame. <code>controlBuffer</code> also acts as the <code>controlBuffer</code> is also responsible for client level traffic control.</li>
+<li>A dataFrame, for example, may contain multiple HTTP2 data frames. The dataFrame is first placed at the end of the <code>itemList</code> of the corresponding stream. Each stream maintains an <code>itemList</code>, which holds the data to be sent.</li>
+<li>The <code>loopyWriter</code> maintains a chain of streams, i.e. <code>activeStreams</code> . Each time <code>loopyWriter</code> takes the stream at the head of the chain, sends up to 16KB of data from its <code>itemList</code> to the client, and then puts the stream at the end of the <code>activeStreams</code> chain.</li>
+</ol>
+<p>In the communication between gRPC server and client, all streams (i.e. all RPC calls) share one <code>loopyWriter</code>.</p>
+<pre><code class="language-go">// run should be run in a separate goroutine.
+// It reads control frames from controlBuf and processes them by:
+// 1. Updating loopy's internal state, or/and
+// 2. Writing out HTTP2 frames on the wire.
+//
+// Loopy keeps all active streams with data to send in a linked-list.
+// All streams in the activeStreams linked-list must have both:
+// 1. Data to send, and
+// 2. Stream level flow control quota available.
+//
+// In each iteration of run loop, other than processing the incoming control
+// frame, loopy calls processData, which processes one node from the activeStreams linked-list.
+// This results in writing of HTTP2 frames into an underlying write buffer.
+// When there's no more control frames to read from controlBuf, loopy flushes the write buffer.
+// As an optimization, to increase the batch size for each flush, loopy yields the processor, once
+// if the batch size is too low to give stream goroutines a chance to fill it up.
+func (l *loopyWriter) run() (err error) {
+	defer func() {
+		if err == ErrConnClosing {
+			// Don't log ErrConnClosing as error since it happens
+			// 1. When the connection is closed by some other known issue.
+			// 2. User closed the connection.
+			// 3. A graceful close of connection.
+			if logger.V(logLevel) {
+				logger.Infof(&quot;transport: loopyWriter.run returning. %v&quot;, err)
+			}
+			err = nil
+		}
+	}()
+	for {
+        // block current goroutine
+		it, err := l.cbuf.get(true)
+		if err != nil {
+			return err
+		}
+        // handle data from controlBuffer, dataFrame will be appended to the end of the corresponding stream's itemList
+		if err = l.handle(it); err != nil {
+			return err
+		}
+        // send the first stream in the activeStreams linked-list, with at most 16KB of data
+		if _, err = l.processData(); err != nil {
+			return err
+		}
+		gosched := true
+	hasdata:
+		for {
+			// 不 block 当前 goroutine
+			it, err := l.cbuf.get(false)
+			if err != nil {
+				return err
+			}
+			if it != nil {
+				if err = l.handle(it); err != nil {
+					return err
+				}
+				if _, err = l.processData(); err != nil {
+					return err
+				}
+				continue hasdata
+			}
+			isEmpty, err := l.processData()
+			if err != nil {
+				return err
+			}
+			if !isEmpty {
+				continue hasdata
+			}
+			if gosched {
+				gosched = false
+                // when there is no enough data in the writer buffer, yield processor to let other goroutines fill int the buffer
+				if l.framer.writer.offset &lt; minBatchSize {
+					runtime.Gosched()
+					continue hasdata
+				}
+			}
+			l.framer.writer.Flush()
+			break hasdata
+
+		}
+	}
+}
+</code></pre>
+<p>There are a few things to note about the <code>run</code> method:</p>
+<ol>
+<li><code>l.cbuf.get</code> is called twice, the first time blocking the current goroutine, but not the second. The first call is blocking because there is no more data to send in all <code>activeStreams</code>, so it blocks to avoid pointless polling. The second non-blocking call is made because the <code>activeStreams</code> may still have data to send and should continue to send data to the client regardless of whether there is new data in the <code>controlBuffer</code>.</li>
+<li>When the data in the write cache in the framer is less than <code>minBatchSize</code>, loopyWriter actively abandons the CPU. When loopyWriter sends data faster than the gRPC server can generate data, loopyWriter abandons the CPU and lets other goroutines (stream s goroutine) to fill the data. This is done in order to pass as much data as possible to <code>net.Conn</code>.</li>
+</ol>
+<h1 id="loopywriter">loopyWriter</h1>
+<pre><code class="language-go">func (l *loopyWriter) processData() (bool, error) {
+    // connection level flow control
+	if l.sendQuota == 0 {
+		return true, nil
+	}
+    // peek the first stream in the activeStreams linked-list
+	str := l.activeStreams.dequeue()
+	if str == nil {
+		return true, nil
+	}
+    // item must be a dataFrame, which is defined in gRPC. It may contain multiple HTTP2 data frames.
+	dataItem := str.itl.peek().(*dataFrame)
+
+	if len(dataItem.h) == 0 &amp;&amp; len(dataItem.d) == 0 { // Empty data frame
+		......
+	}
+    // ensure the data to be sent is within the flow control window.
+	var (
+		buf []byte
+	)
+	......
+    // send the data to the client via framer
+	if err := l.framer.fr.WriteData(dataItem.streamID, endStream, buf[:size]); err != nil {
+		return false, err
+	}
+	......
+	if str.itl.isEmpty() {
+		......
+	} else {
+        // if the stream has more data to send, enqueue it back to the activeStreams linked-list
+		l.activeStreams.enqueue(str)
+	}
+	return false, nil
+}
+</code></pre>
+<p>In <code>loopyWriter.run()</code>, the <code>processData</code> function is executed continuously, in which the first stream in activeStreams is fetched:</p>
+<ol>
+<li>Fetches the first stream from <code>activeStreams</code>.</li>
+<li>The first element of the <code>itemList</code> of the stream is fetched, which must be a dataFrame. dataFrame is a data structure defined in gRPC that contains the data to be sent to the client. The size of a dataFrame may exceed the <code>http2MaxFrameLen</code> limit and will eventually be split into multiple HTTP2 data frames and sent out.</li>
+<li>After traffic control, the size of the data that can be sent is determined and the data to be sent is stored in a <code>buf</code>.</li>
+<li>The data is sent to the client via framer.</li>
+<li>If there is still data to be sent in the stream, the stream is put back into the <code>activeStreams</code>.</li>
+</ol>
+<p>The data in the stream is stored in a single-linked <code>itemList</code> table, so let's see how gRPC implements this single-linked table.</p>
+<pre><code class="language-go">// node in the linked-list
+type itemNode struct {
+	it   interface{}
+	next *itemNode
+}
+
+// itemList contains the header and tail pointer
+type itemList struct {
+	head *itemNode
+	tail *itemNode
+}
+
+func (il *itemList) enqueue(i interface{}) {
+    // construct node
+	n := &amp;itemNode{it: i}
+    // if the tail pointer is nil, the list is empty
+	if il.tail == nil {
+        // head and tail pointer both point to the new node
+		il.head, il.tail = n, n
+		return
+	}
+    // there is at least one node in the list, so the tail pointer's next pointer points to the new node
+	il.tail.next = n
+    // update the tail pointer
+	il.tail = n
+}
+
+// return the first element of the linked-list, but do not remove it from the linked-list
+func (il *itemList) peek() interface{} {
+	return il.head.it
+}
+
+// remove the first element of the linked-list
+func (il *itemList) dequeue() interface{} {
+    // header is nil, return nil
+	if il.head == nil {
+		return nil
+	}
+    // i points to header
+	i := il.head.it
+    // header points to next node
+	il.head = il.head.next
+    // if the list is empty, update tail pointer to nil
+	if il.head == nil {
+		il.tail = nil
+	}
+	return i
+}
+
+// clear the linked-list
+func (il *itemList) dequeueAll() *itemNode {
+    // set head and tail pointer to nil
+	h := il.head
+	il.head, il.tail = nil, nil
+	return h
+}
+
+// check if the linked-list is empty
+func (il *itemList) isEmpty() bool {
+	return il.head == nil
+}
+</code></pre>
+<h1 id="summary">Summary</h1>
+<p>In this article we learn how the gRPC server sends HTTP2 frames to the client. We can see that the gRPC server sends all streams in a round robin fashion to ensure that the data in each stream is transferred equally to the client.</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[gRPC Deep Dive (3): Server Side Communication]]></title>
+        <id>https://xinzheng0459.github.io/post/grpc-deep-dive-3-server-side-communication/</id>
+        <link href="https://xinzheng0459.github.io/post/grpc-deep-dive-3-server-side-communication/">
+        </link>
+        <updated>2022-07-10T14:43:16.000Z</updated>
+        <content type="html"><![CDATA[<figure data-type="image" tabindex="1"><img src="https://cncf-branding.netlify.app/img/projects/grpc/horizontal/color/grpc-horizontal-color.png" alt="gRPC icon" loading="lazy"></figure>
+<p>In the previous article, we learned how the gRPC server establishes an HTTP2 connection with the client, in this article, let's see what the gRPC server does after receiving an RPC request from the client.</p>
+<p>HTTP2 defines several types of frames, including <em>data</em>, <em>headers</em>, <em>settings</em>, <em>ping</em>, <em>goaway</em>, etc. For different frame types, the HTTP/2 server should have different processing logic.</p>
+<pre><code class="language-go">func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
+	if s.quit.HasFired() {
+		rawConn.Close()
+		return
+	}
+	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
+
+	// RPC 连接阶段, 完成 HTTP2 握手
+    // RPC initialization, HTTP/2 handshake
+	st := s.newHTTP2Transport(rawConn)
+	rawConn.SetDeadline(time.Time{})
+	if st == nil {
+		return
+	}
+
+	if !s.addConn(lisAddr, st) {
+		return
+	}
+	go func() {
+        // start RPC communication
+		s.serveStreams(st)
+		s.removeConn(lisAddr, st)
+	}()
+}
+</code></pre>
+<p>In gRPC, the classification and processing of frame types is contained in <code>s.serveStreams</code>.</p>
+<pre><code class="language-go">func (s *Server) serveStreams(st transport.ServerTransport) {
+	defer st.Close()
+	var wg sync.WaitGroup
+
+	var roundRobinCounter uint32
+    // block and receives frames from client
+	st.HandleStreams(func(stream *transport.Stream) {
+		wg.Add(1)
+		......
+		go func() {
+			defer wg.Done()
+            // when a new stream is created, do some configuration
+			s.handleStream(st, stream, s.traceInfo(st, stream))
+		}()
+	}, func(ctx context.Context, method string) context.Context {
+		if !EnableTracing {
+			return ctx
+		}
+		tr := trace.New(&quot;grpc.Recv.&quot;+methodFamily(method), method)
+		return trace.NewContext(ctx, tr)
+	})
+	wg.Wait()
+}
+</code></pre>
+<p><code>st.HandleStreams</code> blocks the current goroutine, and waits for a frame from the client.</p>
+<pre><code class="language-go">func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.Context, string) context.Context) {
+	defer close(t.readerDone)
+	for {
+		t.controlBuf.throttle()
+		frame, err := t.framer.fr.ReadFrame()
+		...
+		switch frame := frame.(type) {
+		case *http2.MetaHeadersFrame:
+			if t.operateHeaders(frame, handle, traceCtx) {
+				t.Close()
+				break
+			}
+		case *http2.DataFrame:
+			t.handleData(frame)
+		case *http2.RSTStreamFrame:
+			t.handleRSTStream(frame)
+		case *http2.SettingsFrame:
+			t.handleSettings(frame)
+		case *http2.PingFrame:
+			t.handlePing(frame)
+		case *http2.WindowUpdateFrame:
+			t.handleWindowUpdate(frame)
+		case *http2.GoAwayFrame:
+			// TODO: Handle GoAway from the client appropriately.
+		default:
+			if logger.V(logLevel) {
+				logger.Errorf(&quot;transport: http2Server.HandleStreams found unhandled frame type %v.&quot;, frame)
+			}
+		}
+	}
+}
+</code></pre>
+<p><code>st.HandleStreams</code> wait for and read frames from the client in a for loop, and handle them differently. In this article, we will take headers, data and settings frames as examples, and briefly describe how the gRPC server handles them.</p>
+<h1 id="header-frame">Header Frame</h1>
+<p>The functions that handle the Headers frame operateHeaders are long, so we'll take a look at them in sections.</p>
+<pre><code class="language-go">func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
+	......
+	streamID := frame.Header().StreamID
+	......
+	buf := newRecvBuffer()
+	s := &amp;Stream{
+		id:  streamID,
+		st:  t,
+		buf: buf,
+		fc:  &amp;inFlow{limit: uint32(t.initialWindowSize)},
+	}
+	......
+}
+</code></pre>
+<p>On the gRPC server and client sides, there is a concept of a stream that characterizes a gRPC call. A gRPC call always starts with a frame of headers from the client, so the server creates a stream object in the <code>operatorHeaders</code>, The stream has a consistent id on the client and server sides, and also has a <code>buf</code> cache. We will discuss the details of caching and flow control in a later chapter.</p>
+<pre><code class="language-go">func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
+	......
+	for _, hf := range frame.Fields {
+		switch hf.Name {
+		case &quot;content-type&quot;:
+			contentSubtype, validContentType := grpcutil.ContentSubtype(hf.Value)
+			if !validContentType {
+				break
+			}
+			mdata[hf.Name] = append(mdata[hf.Name], hf.Value)
+			s.contentSubtype = contentSubtype
+			isGRPC = true
+		case &quot;grpc-encoding&quot;:
+			s.recvCompress = hf.Value
+		case &quot;:method&quot;:
+			httpMethod = hf.Value
+		case &quot;:path&quot;:
+			s.method = hf.Value
+		case &quot;grpc-timeout&quot;:
+			timeoutSet = true
+			var err error
+			if timeout, err = decodeTimeout(hf.Value); err != nil {
+				headerError = true
+			}
+		// &quot;Transports must consider requests containing the Connection header
+		// as malformed.&quot; - A41
+		case &quot;connection&quot;:
+			if logger.V(logLevel) {
+				logger.Errorf(&quot;transport: http2Server.operateHeaders parsed a :connection header which makes a request malformed as per the HTTP/2 spec&quot;)
+			}
+			headerError = true
+		default:
+			if isReservedHeader(hf.Name) &amp;&amp; !isWhitelistedHeader(hf.Name) {
+				break
+			}
+			v, err := decodeMetadataHeader(hf.Name, hf.Value)
+			if err != nil {
+				headerError = true
+				logger.Warningf(&quot;Failed to decode metadata header (%q, %q): %v&quot;, hf.Name, hf.Value, err)
+				break
+			}
+			mdata[hf.Name] = append(mdata[hf.Name], v)
+		}
+	}
+	......
+}
+</code></pre>
+<p>The gRPC server will traverse the fields in the frame and record the information in the fields in the stream. It is worth noting that the <code>:method</code> and <code>:path</code> fields need to be filled in by the client to specify which remote procedure to call from the server. In other words, the information about which server method to call is in a separate frame from the parameters of the calling method.</p>
+<pre><code class="language-go">func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
+	......
+	t.activeStreams[streamID] = s
+	......
+	handle(s)
+	......
+}
+</code></pre>
+<p>The new stream object is placed in the server's <code>activeStreams</code> map, and <code>handle(s)</code> is called to further process the stream. <code>handle</code> will eventually trigger a call to <code>s.handleStream</code>.</p>
+<pre><code class="language-go">func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Stream, trInfo *traceInfo) {
+	sm := stream.Method()
+	......
+	service := sm[:pos]
+	method := sm[pos+1:]
+
+	srv, knownService := s.services[service]
+	if knownService {
+		if md, ok := srv.methods[method]; ok {
+			s.processUnaryRPC(t, stream, srv, md, trInfo)
+			return
+		}
+		if sd, ok := srv.streams[method]; ok {
+			s.processStreamingRPC(t, stream, srv, sd, trInfo)
+			return
+		}
+	}
+	......
+	if err := t.WriteStatus(stream, status.New(codes.Unimplemented, errDesc)); err != nil {
+		......
+	}
+	......
+}
+</code></pre>
+<p>Based on the path and method information in the headers frame, the gRPC server finds the registered method and executes it. Take <code>s.processUnaryRPC</code> as an example:</p>
+<pre><code class="language-go">func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.Stream, info *serviceInfo, md *MethodDesc, trInfo *traceInfo) (err error) {
+	......
+	d, err := recvAndDecompress(&amp;parser{r: stream}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
+	......
+	reply, appErr := md.Handler(info.serviceImpl, ctx, df, s.opts.unaryInt)
+	......
+	if err := s.sendResponse(t, stream, reply, cp, opts, comp); err != nil {
+		......
+	}
+	err = t.WriteStatus(stream, statusOK)
+	......
+}
+</code></pre>
+<p>Firstly, the data frames are read from the stream, i.e. the parameter information of the RPC method. <code>md.Handler</code> will execute the registered methods and send the reply to the client (not directly to the client, but by storing the data in a buffer and sending it to the <code>loopyWriter</code>. <code>WriteStatus</code> is executed at the end of a stream, which marks the end of the stream.</p>
+<h1 id="data-frame">Data Frame</h1>
+<pre><code class="language-go">func (t *http2Server) handleData(f *http2.DataFrame) {
+	......
+	// Select the right stream to dispatch.
+	s, ok := t.getStream(f)
+	if !ok {
+		return
+	}
+	......
+	if size &gt; 0 {
+		......
+		if len(f.Data()) &gt; 0 {
+			buffer := t.bufferPool.get()
+			buffer.Reset()
+			buffer.Write(f.Data())
+			s.write(recvMsg{buffer: buffer})
+		}
+	}
+	......
+}
+</code></pre>
+<p>When processing the data frame</p>
+<ol>
+<li>Based on streamId, find the stream object from the server's <code>activeStreams</code> map.</li>
+<li>Get a buffer from the <code>bufferPool</code> and write the data of the frame to the buffer.</li>
+<li>Save this buffer to the stream's <code>recvBuffer</code>.</li>
+</ol>
+<p>The data cached in the <code>recvBuffer</code> will eventually be read by the <code>recvAndDecompress</code> function mentioned above to reconstruct the RPC parameters on the server side.</p>
+<h1 id="settings-frame">Settings Frame</h1>
+<p>In addition to the headers frame and data frame necessary to complete a gRPC call, the server side may receive a setting frame from the client during the RPC interaction phase to update some of the HTTP2 parameters.</p>
+<pre><code class="language-go">func (t *http2Server) handleSettings(f *http2.SettingsFrame) {
+	......
+	var ss []http2.Setting
+	......
+	f.ForeachSetting(func(s http2.Setting) error {
+		switch s.ID {
+		......
+		default:
+			ss = append(ss, s)
+		}
+		return nil
+	})
+	t.controlBuf.executeAndPut(func(interface{}) bool {
+		for _, f := range updateFuncs {
+			f()
+		}
+		return true
+	}, &amp;incomingSettings{
+		ss: ss,
+	})
+}
+</code></pre>
+<p>handleSettings does not apply the settings frame parameters directly to the server, but puts them into the <code>controlBuf</code>, which will be covered in a later chapter.</p>
+<h1 id="summary">Summary</h1>
+<p>As you can see, the gRPC server is basically asynchronous throughout the processing flow, except for the execution of registered methods. The operations are connected together by buffer to avoid goroutine blocking to the maximum extent possible.</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[gRPC Deep Dive (2): Server Initialization]]></title>
+        <id>https://xinzheng0459.github.io/post/grpc-deep-dive-2-server-initialization/</id>
+        <link href="https://xinzheng0459.github.io/post/grpc-deep-dive-2-server-initialization/">
+        </link>
+        <updated>2022-07-10T14:16:02.000Z</updated>
+        <content type="html"><![CDATA[<figure data-type="image" tabindex="1"><img src="https://cncf-branding.netlify.app/img/projects/grpc/horizontal/color/grpc-horizontal-color.png" alt="gRPC icon" loading="lazy"></figure>
+<p>When a gRPC client sends a request to a gRPC server, the interaction between the client and the server can be roughly divided into two phases:</p>
+<p>RPC initialization phase: client and server establish TCP connection and set HTTP2 initialization parameters.<br>
+RPC communication phase: client sends request data to server, server executes and returns the execution result to client.</p>
+<p>In this article, let's take a look at what the gRPC server does during the RPC connection phase.</p>
+<h1 id="establish-tcp-connection">Establish TCP Connection</h1>
+<pre><code class="language-go">lis, err := net.Listen(&quot;tcp&quot;, fmt.Sprintf(&quot;:%d&quot;, *port))
+if err != nil {
+	log.Fatalf(&quot;failed to listen: %v&quot;, err)
+}
+
+s := grpc.NewServer()
+pb.RegisterGreeterServer(s, &amp;server{})
+
+if err := s.Serve(lis); err != nil {
+	log.Fatalf(&quot;failed to serve: %v&quot;, err)
+}
+</code></pre>
+<p>The gRPC server relies on golang's native <code>net.Listener</code> to create a TCP connection to the client. After calling <code>s.Serve(list)</code>, the program blocks and waits for access from the client.</p>
+<pre><code class="language-go">func (s *Server) Serve(lis net.Listener) error {
+	......
+	s.serve = true
+	......
+	for {
+		rawConn, err := lis.Accept()
+		if err != nil {
+			......
+		}
+		......
+		s.serveWG.Add(1)
+		go func() {
+			s.handleRawConn(lis.Addr().String(), rawConn)
+			s.serveWG.Done()
+		}()
+
+}
+</code></pre>
+<p>Like most servers, the gRPC server waits for accesses from the client in a &quot;for&quot; loop, creates a golang native <code>net.Conn</code> All requests from this client, regardless of which remote method the client calls, or how many times it calls it, are handled by the same goroutine. Next, let's see how the gRPC server handles this <code>net.Conn</code> object.</p>
+<pre><code class="language-go">func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
+	// if gRPC server was closed, close the connection
+	if s.quit.HasFired() {
+		rawConn.Close()
+		return
+	}
+	// setup deadline for the tcp connection
+	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
+
+	// Finish handshaking (HTTP2)
+	// RPC initialization, where client and server handshake with each other
+	st := s.newHTTP2Transport(rawConn)
+	rawConn.SetDeadline(time.Time{})
+	if st == nil {
+		return
+	}
+
+	if !s.addConn(lisAddr, st) {
+		return
+	}
+    // RPC communication, data from client is handled in a new goroutine
+	go func() {
+		s.serveStreams(st)
+		s.removeConn(lisAddr, st)
+	}()
+}
+</code></pre>
+<p>You can see that for each new connection from the client, the gRPC server goes through an RPC initialization phase and an RPC communication phase. In this article we will look at what happens in the RPC initialization phase, i.e. <code>s.netHTTP2Transport</code>.</p>
+<pre><code class="language-go">func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
+	config := &amp;transport.ServerConfig{
+		MaxStreams:            s.opts.maxConcurrentStreams,
+		ConnectionTimeout:     s.opts.connectionTimeout,
+		......
+	}
+	
+	// handshake with the client
+	st, err := transport.NewServerTransport(c, config)
+	if err != nil {
+		......
+	}
+
+	return st
+}
+</code></pre>
+<p><code>transport.NewServerTransport</code> was called to complete the HTTP2 handshake with the client, depending on the user's configuration items when starting the gRPC server, or the default configuration items. <code>transport.NewServerTransport</code> is a quite long function, so let's dig into it deeply in next section.</p>
+<h1 id="http2-handshake">HTTP/2 Handshake</h1>
+<pre><code class="language-go">func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+	......
+	rawConn := conn
+	......
+	writeBufSize := config.WriteBufferSize
+	readBufSize := config.ReadBufferSize
+	maxHeaderListSize := defaultServerMaxHeaderListSize
+	if config.MaxHeaderListSize != nil {
+		maxHeaderListSize = *config.MaxHeaderListSize
+	}
+	framer := newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize)
+	......
+}
+</code></pre>
+<p>First a framer is created, which is responsible for receiving and sending HTTP/2 frames, and is the actual interface between the server and the client.</p>
+<pre><code class="language-go">func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+	......
+	// send initial settings as connection preface to client.
+	isettings := []http2.Setting{{
+		ID:  http2.SettingMaxFrameSize,
+		Val: http2MaxFrameLen,
+	}}
+
+	maxStreams := config.MaxStreams
+	if maxStreams == 0 {
+		maxStreams = math.MaxUint32
+	} else {
+		isettings = append(isettings, http2.Setting{
+			ID:  http2.SettingMaxConcurrentStreams,
+			Val: maxStreams,
+		})
+	}
+	dynamicWindow := true
+	iwz := int32(initialWindowSize)
+	if config.InitialWindowSize &gt;= defaultWindowSize {
+		iwz = config.InitialWindowSize
+		dynamicWindow = false
+	}
+	......
+    // server sends initial settings to client by framer
+	if err := framer.fr.WriteSettings(isettings...); err != nil {
+		return nil, connectionErrorf(false, err, &quot;transport: %v&quot;, err)
+	}
+	......
+}
+</code></pre>
+<p>The gRPC server first specifies its initial HTTP2 configuration, such as InitialWindowSize, MaxHeaderListSize, etc., and sends this configuration information to the client via <code>framer.fr</code>. <code>framer.fr</code> is actually golang's native <code>http2.Framer</code> . At the bottom, this configuration information is wrapped in a Setting Frame and sent to the client in binary format.</p>
+<p>After receiving the Setting Frame, the client adjusts some parameters according to its own situation, and also sends a Setting Frame back to the client.</p>
+<pre><code class="language-go">func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+	......
+	t := &amp;http2Server{
+		......
+		conn:              conn,
+		remoteAddr:        conn.RemoteAddr(),
+		localAddr:         conn.LocalAddr(),
+		......
+		framer:            framer,
+		......
+	}
+    // controlBuf is a buffer for frames, which is used to control the outbound traffic of a connection.
+	t.controlBuf = newControlBuffer(t.done)
+	......
+	// flush the framer
+	t.framer.writer.Flush()
+	......
+}
+</code></pre>
+<p>After sending the setting frame, the gRPC server creates the <code>http2Server</code> object. And wait for further messages from the client.</p>
+<pre><code class="language-go">func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+	......
+	// Check the validity of client preface.
+	preface := make([]byte, len(clientPreface))
+	if _, err := io.ReadFull(t.conn, preface); err != nil {
+		......
+	}
+	......
+	if !bytes.Equal(preface, clientPreface) {
+		return nil, connectionErrorf(false, nil, &quot;transport: http2Server.HandleStreams received bogus greeting from client: %q&quot;, preface)
+	}
+
+	frame, err := t.framer.fr.ReadFrame()
+	......
+	sf, ok := frame.(*http2.SettingsFrame)
+	if !ok {
+		return nil, connectionErrorf(false, nil, &quot;transport: http2Server.HandleStreams saw invalid preface type %T from client&quot;, frame)
+	}
+    // adjust HTTP/2 configuration parameters according to client's response
+	t.handleSettings(sf)
+	......
+}
+</code></pre>
+<p>In HTTP2, both client and server require a connection preface to be sent before a connection can be established, as a final confirmation of the protocol used and to determine the initial settings for the HTTP2 connection. The preface sent by the client starts with a 24-byte sequence, expressed in hexadecimal as <code>0x505249202a20485454502f322e300d0a0d0a534d0d0a0d0a</code> . This is followed by a setting frame, which represents the final HTTP2 configuration parameters decided by the client. <code>NewServerTransport</code> contains the code to read and validate the preface, and to read and apply the setting frame.</p>
+<pre><code class="language-go">func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+	......
+	go func() {
+		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst)
+		t.loopy.ssGoAwayHandler = t.outgoingGoAwayHandler
+		if err := t.loopy.run(); err != nil {
+			if logger.V(logLevel) {
+				logger.Errorf(&quot;transport: loopyWriter.run returning. Err: %v&quot;, err)
+			}
+		}
+		t.conn.Close()
+		t.controlBuf.finish()
+		close(t.writerDone)
+	}()
+	go t.keepalive()
+	return t, nil
+}
+</code></pre>
+<p>At this point the HTTP2 connection between server and client is established and the RPC initialization phase is completed. At the end of <code>NetServerTransport</code>, <code>loopyWriter</code> is started and the RPC communication phase begins. The <code>loopyWriter</code> continuously reads control frames (including setting frames) from the <code>controlBuf</code> and sends the cached frames to the client. The <code>loopyWriter</code> is where the gRPC server controls the traffic and sends the data. Details will be introduced in subsequent chapters.</p>
+<h1 id="summary">Summary</h1>
+<p>The gRPC server handles TCP connections from the client in a separate goroutine, and establishes HTTP/2 connections with the client via the standard HTTP/2 handshake process.</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[gRPC Deep Dive (1): Overview]]></title>
+        <id>https://xinzheng0459.github.io/post/grpc-deep-dive-1-overview/</id>
+        <link href="https://xinzheng0459.github.io/post/grpc-deep-dive-1-overview/">
+        </link>
+        <updated>2022-07-10T13:15:25.000Z</updated>
+        <content type="html"><![CDATA[<figure data-type="image" tabindex="1"><img src="https://cncf-branding.netlify.app/img/projects/grpc/horizontal/color/grpc-horizontal-color.png" alt="gRPC icon" loading="lazy"></figure>
+<p><strong>gRPC Deep Dive</strong> is a series of articles documenting some understanding and discoveries while reading, studying and using the gRPC source code. Anyone who reads this article can get a glimpse of what the designers of gRPC had in mind when building such a high-performance RPC framework, and think about what it should look like if we were designing it.</p>
+<p>The article series will introduce, with the help of source code analysis, how a gRPC connection between client and server is established, and the entire flow of a gRPC call (communication). After that, we will discuss how some key features of gRPC are implemented and explore the secrets of gRPC performance.</p>
+<blockquote>
+<p>The source codes listed in articles are from https://github.com/grpc/grpc-go. Consider that the source code is complicated, so only the part of the codes that are relevant to the topic under discussion has been extracted.</p>
+</blockquote>
+<p>As the first chapter of the gRPC Deep Dive, let's take a look at how the gRPC server and client establish a connection and send messages.</p>
+<h1 id="grpc-flow">gRPC Flow</h1>
+<figure data-type="image" tabindex="2"><a href="https://mermaid.live/edit#pako:eNqdkrFOwzAQhl_l5AmkdKCoAxm6mA5sFWHMcrWvyUnJudgXBFR9dxzSIgplwYNl6fv8353svXHBkylNoueBxNE9YxOxrwXy2mFUdrxDUbCACWzHJPobViOsKL5QnOC0R3IKsdlc3dzdFPP5bTFfLK4nJEEJQvbBFlCV0DyuLTwIK2PH76gcZBItzJbL0VglxU3HqYUnuwYXRHL6mTZaNoToWTCnb_McBIlUWZo0aSS-lv81Z0PfD8LuUm9VzoWW0Ocrn2UvcY-K32kFs9Nor-SGXLInbYP_ohnaP7PP-c_s45ymMD3FHtnnJ96PqDbaUrZMmY-etjh0WptaDlkddjmGVp41RFNusUtUGBw0VG_iTKlxoJN0_CZH6_ABewy2WQ"><img src="https://mermaid.ink/img/pako:eNqdkrFOwzAQhl_l5AmkdKCoAxm6mA5sFWHMcrWvyUnJudgXBFR9dxzSIgplwYNl6fv8353svXHBkylNoueBxNE9YxOxrwXy2mFUdrxDUbCACWzHJPobViOsKL5QnOC0R3IKsdlc3dzdFPP5bTFfLK4nJEEJQvbBFlCV0DyuLTwIK2PH76gcZBItzJbL0VglxU3HqYUnuwYXRHL6mTZaNoToWTCnb_McBIlUWZo0aSS-lv81Z0PfD8LuUm9VzoWW0Ocrn2UvcY-K32kFs9Nor-SGXLInbYP_ohnaP7PP-c_s45ymMD3FHtnnJ96PqDbaUrZMmY-etjh0WptaDlkddjmGVp41RFNusUtUGBw0VG_iTKlxoJN0_CZH6_ABewy2WQ" alt="" loading="lazy"></a></figure>
+<p>In gRPC, the gRPC process can be roughly divided into two phases, the RPC initialization phase and the RPC communication phase.</p>
+<p>In the RPC initialization phase, a TCP connection is established between the client and the server, and since gRPC relies on HTTP2, the client and the server also need to coordinate frame related settings, such as frame size, sliding window size, etc.<br>
+In the RPC communication phase, the client sends the data to the server and waits for the server to execute the specified method and then returns the result.</p>
+<h1 id="client-side-flow">Client Side Flow</h1>
+<p>During the RPC initialization phase, the client receives a destination address (string) and a set of DialOptions, then:</p>
+<ol>
+<li>Client configures the connection parameters, interceptor, etc., and start the <strong>resolver</strong>.</li>
+<li>The <strong>Resolver</strong> gets a list of server addresses based on the target address (e.g. a DNS name may point to multiple server ip's, dnsResolver is one of the built-in resolvers for gRPC). <strong>Resolver</strong> then starts the balancer.</li>
+<li>The <strong>balancer</strong> selects one or more of the many server addresses to establish a TCP connection based on a balancing policy.</li>
+<li>After the TCP connection is established, the client waits for the HTTP2 Settings frame from the server and adjusts its HTTP2-related configuration. It then sends the HTTP2 Settings frame to the server.</li>
+</ol>
+<p>During the RPC communication phase, after a local method has been called:</p>
+<ol>
+<li>Client creates a stream object to manage the entire communication.</li>
+<li>The Client puts the service name, method name and other information into the header frame and sends it to the server.</li>
+<li>Client puts the method parameters into the data frame and sends it to the server.</li>
+<li>The Client waits for the header frame and data frame from the server. The result status of an RPC call is included in the header frame, and the return value of the method is included in the data frame.</li>
+</ol>
+<h1 id="server-side-flow">Server Side Flow</h1>
+<p>During the RPC initialization phase, the server starts listening to a TCP port after completing some initial configuration. After establishing a TCP connection with a client, the HTTP2 settings frame interaction is conducted.</p>
+<p>During the RPC communication phase,</p>
+<ol>
+<li>Server waits for the header frame from the client and creates a stream object to manage the whole interaction process. Based on the information in the header frame, the server knows which method of which service is requested by the client.</li>
+<li>Server receives the data frame from the client and executes the method.</li>
+<li>Server sends the method to the client in the header frame with information about whether the execution was successful or not.</li>
+<li>Server puts the result (return value) of the method execution in the data frame and sends it to the client.</li>
+</ol>
+<h1 id="summary">Summary</h1>
+<p>Under the hood, gRPC fully utilize two concepts in HTTP/2, which are <strong>frame</strong> and <strong>stream</strong>. Actually, gRPC is not a HTTP/2 user, it violates the &quot;request-response&quot; model of HTTP/2, and construct its own protocol based on frame and stream.</p>
+<p>For a single gRPC call, not matter whether it is an unary call or bidirectional stream, there will be one unique stream being created with a monotonically increasing stream id. Countless frames can be sent based on that stream id, initiating by client or server.</p>
+]]></content>
+    </entry>
+</feed>
